@@ -1,0 +1,31 @@
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Private inputs and generated research outputs
+data/
+datasets/
+results/
+runs/
+outputs/
+checkpoints/
+logs/
+.optimization/
+*.log
+*.out
+*.err
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+experiments.csv
+experiment-log.csv
+experiment-queue.csv
+
+# Local durable runner state, logs, and review results
+.research/

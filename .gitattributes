@@ -1,0 +1,2 @@
+# Keep Python shebangs and text files portable across Windows and Linux.
+* text=auto eol=lf
