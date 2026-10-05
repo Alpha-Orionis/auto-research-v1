@@ -82,6 +82,37 @@ Use the paper reviewer or documentation reviewer when a separate read-only
 audit would help. Give each reviewer the minimum project context
 needed. Verify important reviewer claims against the source evidence yourself.
 
+## Keep the foreground available
+
+- Submit approved experiments with `scripts/experiment_runner.py run` in its
+  default background mode. Submit other approved long commands with `task`,
+  a unique ID, an explicit deadline, a resource limit, and an approval
+  reference. Use `--parent-id` to associate an independently bounded subtask
+  with an existing task. Do not use `--foreground` unless the user explicitly
+  requests synchronous execution.
+- A launch receipt is only confirmation that work was submitted. Report its
+  task ID and status reference, then return control to the conversation.
+  Do not hold the foreground in a polling loop or stream background logs
+  into every reply. Continue independent work and answer new messages.
+- On the next interaction, or at an authorized progress check, use `status`
+  and `events --after <saved_cursor>`. Summarize new completion, warning, or
+  failure events once. Read only the relevant log excerpts when necessary.
+  These local events do not wake an idle conversation or send UI messages.
+- Give every concurrent task a distinct output location. Avoid conflicting
+  edits to shared inputs. At most four workers run by default, and experiment
+  execution/review remains serial. A native synchronous OpenCode subagent
+  call is not made asynchronous by these instructions. A background model
+  task needs an explicitly approved non-interactive CLI command, a compatible
+  primary/all agent, and its own scoped permissions and data-flow approval.
+- The sentinel records heartbeat and resource samples. Quiet logs or high
+  usage are signals to inspect, not proof of a stalled process. Do not kill
+  or restart a task based only on a warning. Use `cancel --id` when the user
+  requests cancellation. Cancellation applies to the selected worker; check
+  related tasks separately. Use explicit recovery for uncertain outcomes.
+- Keep task configurations, outputs, telemetry, and event files under local
+  `.research/`. Do not publish them or send telemetry to a reviewer without
+  separate authorization.
+
 ## Final response
 
 Summarize what changed, what evidence was checked, what was not checked, and

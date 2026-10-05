@@ -74,6 +74,8 @@ class InstallerChecks(unittest.TestCase):
         self.assertIn("private/", ignore.read_text())
         self.assertIn(".research/", ignore.read_text())
         self.assertEqual((self.target / "scripts/experiment_runner.py").read_bytes(), (PROJECT / "scripts/experiment_runner.py").read_bytes())
+        for module in ("task_runtime.py", "resource_monitor.py"):
+            self.assertEqual((self.target / "scripts" / module).read_bytes(), (PROJECT / "scripts" / module).read_bytes())
         before = {path.relative_to(self.target): (path.read_bytes(), path.stat().st_mtime_ns) for path in self.target.rglob("*") if path.is_file()}
         completed = self.invoke()
         self.assertEqual(completed.returncode, 0, completed.stderr)

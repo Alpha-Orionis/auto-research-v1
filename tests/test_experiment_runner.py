@@ -268,7 +268,7 @@ class RunnerChecks(unittest.TestCase):
     def test_cli_uses_same_pipeline(self):
         completed = subprocess.run(
             [sys.executable, str(PROJECT / "scripts" / "experiment_runner.py"), "--project", str(self.root),
-             "--opencode-command-json", json.dumps(self.prefix), "run", "--id", "exp-one"],
+             "--opencode-command-json", json.dumps(self.prefix), "run", "--id", "exp-one", "--foreground"],
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)

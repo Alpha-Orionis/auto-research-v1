@@ -1,8 +1,9 @@
 # Usage
 
 This repository contains project-local OpenCode agent definitions, one
-reusable skill, blank templates, and an opt-in Python experiment runner. The
-runner uses only Python's standard library and requires Python 3.10 or newer.
+reusable skill, blank templates, and an opt-in Python experiment runner with
+detached background workers and read-only monitoring. The scripts use only
+Python's standard library and require Python 3.10 or newer.
 The supplied agent permission format supports OpenCode V1, version 1.2.0 or
 newer. OpenCode V2 requires migrated agent definitions; the runner rejects
 that version before starting an experiment. Older V1 versions incorrectly
@@ -81,12 +82,20 @@ metrics and result summaries in those outputs if they need review.
    python scripts/experiment_runner.py run --id exp-001
    ```
 
-The runner checks approvals and dependencies, starts only that experiment,
-captures stdout and stderr under `.research/runs/<id>/`, and waits for the
-process to exit. It then writes a manifest and immediately invokes the
-read-only `experiment-reviewer` through `opencode run`. The queue remains
-blocked until the review has been recorded. Review success means the reviewer
-completed; it does not mean the experiment passed its hypothesis.
+The launch command checks approvals, ordering, dependencies, and the command,
+then returns a JSON submission receipt with `task_id`, `worker_pid`, and
+`status_reference`. This confirms a durable worker handoff, not successful
+execution or a completed review. OpenCode version preflight happens in the
+worker; a failed preflight appears in task status and its worker error log.
+
+The independent worker starts only that experiment, captures stdout/stderr
+under `.research/runs/<id>/`, and waits for the process to exit. It then writes
+a manifest and invokes the read-only `experiment-reviewer` through
+`opencode run`. No further foreground message is needed to start this review.
+The queue remains blocked until review has been recorded. Review success
+means the reviewer completed; it does not mean the hypothesis passed.
+An experiment task marked `SUCCEEDED` means the execution/review workflow
+completed. Inspect `experiments[].outcome` for the experiment's actual result.
 The runner reads OpenCode's JSON events and requires a non-empty report plus
 a final `stop` event. Errors, agent fallback messages, and incomplete reports
 leave the queue blocked. The generated report is stored as `review.md`.
@@ -97,6 +106,142 @@ The reviewer process starts with the project root as its working directory;
 it does not depend on the newer `opencode run --dir` option. Read rules cover
 both absolute paths used by older V1 releases and relative paths used by
 newer releases, with Windows and Linux path separators.
+
+## Keep long tasks in the background
+
+`run`, `review`, `recover`, and `reconcile` use detached workers by default.
+Their launchers return promptly without waiting for the command or review.
+Standard input is closed and each process writes to its own files, so commands
+must be non-interactive. A background worker holds the execution lock while
+running an experiment, but foreground status reads do not acquire that lock.
+
+Use the receipt's task ID to inspect it:
+
+```text
+python scripts/experiment_runner.py status --id exp-001
+python scripts/experiment_runner.py status
+python scripts/experiment_runner.py events --limit 20
+python scripts/experiment_runner.py events --after <next_cursor> --limit 20
+```
+
+`status` returns task snapshots and a brief experiment ledger; it does not
+wait for work to finish. `events` returns compact start, warning, completion,
+and attention records, plus `next_cursor`. Keep that cursor to avoid repeating
+old events. A task ID from `review`, `recover`, or `reconcile` is generated
+separately from the experiment ID. No command automatically starts another
+experiment from the queue.
+
+For an independently approved preparation or analysis script:
+
+```bash
+python3 scripts/experiment_runner.py task --id prepare-001 \
+  --command-json '["python3", "scripts/prepare_inputs.py"]' \
+  --working-directory . --time-limit-minutes 10 \
+  --resource-limit 'one CPU process' \
+  --approval-reference 'approved preparation step' --parent-id exp-001
+```
+
+Supply your actual script, budget, and approval reference. `task` accepts a
+non-empty JSON argument array and starts it with `shell=False`. Plain command
+tasks do not require OpenCode. The working directory must be within the
+project. The task ID is single-use, including after launch failure or
+cancellation. `--parent-id` is optional and must name an existing task.
+It links records rather than imposing dependency order, shared budgets, or
+cascading cancellation. Concurrent commands must use separate output paths
+and avoid conflicting writes.
+
+The default maximum is four active workers per project, including at most
+one experiment/review worker. A launch exceeding the cap is rejected before
+starting work. `--max-background-jobs N` (1-32) changes the admission cap for
+that submission; use the same approved value consistently. This is a count
+of registered workers, not an operating-system process or resource quota.
+
+The Research Agent should report a submitted task's ID, then return to the
+conversation and read status/events at its next interaction or authorized
+check. It should not hold the foreground in a polling loop. Local event
+records do not send chat messages, wake an idle OpenCode session, or provide
+an app notification service. A synchronous native OpenCode subagent call
+still occupies its caller. To run model work in the background, submit an
+explicitly approved headless CLI command with a primary/all agent, its own
+permissions, and an approved provider data scope. The supplied paper/doc
+reviewers are subagents and cannot be selected directly with `opencode run`.
+
+If a terminal explicitly needs to wait for execution and review, use:
+
+```text
+python scripts/experiment_runner.py run --id exp-001 --foreground
+```
+
+This synchronous mode does not provide the detached task sentinel or the
+task cancellation interface. It is intended for explicit terminal use and
+offline checks, rather than foreground conversation work.
+
+## Running sentinel and resources
+
+Each background task persists its worker/child process IDs, phase, heartbeat,
+outcome, and log references under `.research/tasks/<task-id>/`. Heartbeats
+update about every five seconds during a managed process. A read-only
+resource sample is recorded at process start and every 30 seconds by default:
+
+- Host CPU usage and total/available RAM.
+- Managed child's CPU usage and resident memory; Linux also reports its I/O.
+- Free disk space on the project volume.
+- Optionally, utilization and memory for selected numeric NVIDIA device IDs.
+
+CPU rates need two samples; a multithreaded process's CPU rate can exceed
+100 percent because it is measured per core. Missing counters remain null
+or unavailable. Values cover the direct process or whole host/device as
+labelled, not a sum of an entire descendant process tree or a per-task GPU
+allocation. No usernames, hostnames, inherited environment, or raw command
+arguments are included in telemetry or compact events. Task configuration
+and captured output can contain user-supplied private data; keep them local.
+
+Sampling and warning options go after the action:
+
+```text
+python scripts/experiment_runner.py run --id exp-001 --sample-seconds 30 --stall-seconds 900 --gpu-ids 0,1
+```
+
+`--sample-seconds` accepts 0.1-3600 seconds. `--stall-seconds` is a positive
+quiet-output threshold, default 900 seconds. GPU reads are disabled unless
+`--gpu-ids` is supplied; they use only `nvidia-smi` queries, with a three-second
+timeout. An absent GPU or unavailable tool does not prevent a task from
+running. The scripts never allocate GPU memory or start a GPU cache pool.
+
+The sentinel records warnings for quiet logs, free disk below 256 MiB,
+available host RAM below two percent, or selected device memory at least
+95 percent full. Warnings are emitted on transitions and do not kill or retry
+a task. Quiet output alone does not establish a stall. A status read marks
+heartbeat age over 45 seconds as stale, and a dead worker as `INTERRUPTED` or,
+if its recorded child still appears alive, `ORPHANED`. These observations
+require inspection and do not authorize a duplicate launch.
+
+Resource samples stay in `.research/tasks/<task-id>/resources.jsonl`; compact
+events stay in `.research/events/`. They are outside the Experiment Reviewer's
+`.research/runs/` read scope and are not automatically sent to the model.
+There is no independent monitoring daemon or automatic restart after reboot.
+
+## Cancel a selected background task
+
+```text
+python scripts/experiment_runner.py cancel --id exp-001
+python scripts/experiment_runner.py status --id exp-001
+```
+
+Cancellation writes a request; it does not prove the process has stopped.
+The live worker checks it between supervision waits (normally about one
+second, plus any resource query), stops and reaps its owned direct child,
+then records `CANCELLED`. Preflight version queries can take up to 15 seconds.
+Check status for the terminal result. An already ended/orphaned task cannot
+be cancelled through a dead worker, and parent cancellation does not cascade
+to registered subtasks. Inspect and cancel each selected task explicitly.
+
+Cancelling an experiment records outcome `CANCELLED` with `REVIEW_PENDING`
+and stops the worker without launching another model call. Run `review --id`
+explicitly if its evidence should be reviewed. Cancelling an active review
+records `REVIEW_FAILED`; an authorized `review --id ... --retry` is required.
+Both states block the next experiment. A cancellation request arriving after
+completion can legitimately leave the finished result unchanged.
 
 ## Recovery
 
@@ -118,6 +263,12 @@ python scripts/experiment_runner.py reconcile --id exp-001 --outcome FAILED --re
 A review left in `REVIEWING` is recovered from its complete event receipt
 when possible, without launching a duplicate review. Otherwise it is marked
 `REVIEW_FAILED` for an explicit retry. Recorded live processes are left alone.
+
+These commands submit a new background worker and return its task ID. Read
+`status` to confirm completion; if another experiment/review worker is still
+active, submission is rejected. Do not relaunch a task merely because its
+launcher or conversation ended. Generic command tasks are not automatically
+resumed; inspect their output and approve a new ID for a retry if needed.
 
 To retry a failed review, explicitly run:
 
@@ -161,11 +312,20 @@ keep repository text files in LF format. Experiment IDs use 1-64 ASCII letters,
 digits, dots, underscores, or hyphens, begin with a letter or digit, and cannot
 end in a dot or use Windows device names such as `CON` or `NUL`.
 
-Run one runner per project on one machine. Use a local filesystem with working
+Run background workers for a project on one machine. Use a local filesystem with working
 file locks and atomic replacement; distributed execution on shared network
 storage is not supported. A running experiment cannot be moved between
 Windows and Linux; process identifiers and active state belong to the machine
 that started it.
+
+Linux workers start in a new process session; Windows workers use detached
+process creation with a separate process group. Log handles replace the
+launcher's pipes, so a worker can outlive its launcher and foreground tool
+call. This is not a system service: shutdown, logout policies, containers,
+or hosts that explicitly kill every descendant may stop it. Apply the
+recovery rules to uncertain experiment state. Commands remain responsible
+for children they spawn themselves; registered `task` workers have their own
+limits and must be cancelled separately.
 
 ## Public repository hygiene
 
@@ -190,7 +350,9 @@ python -m unittest discover -s tests -v
 
 These checks use synthetic experiments and a fake OpenCode process. They
 exercise completion, failure, timeout, locking, queue gating, and recovery
-without sending project data to a model provider.
+as well as detached launches, foreground status responsiveness, concurrent
+subtasks, cancellation, warnings, and unavailable GPU counters, without
+sending project data to a model provider.
 On Linux, use `python3` if needed. GitHub Actions runs these checks on Linux
 and Windows with Python 3.10 and 3.12. Platform-specific checks are skipped
 on the other operating system.

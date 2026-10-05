@@ -91,9 +91,12 @@ verified, stop and ask.
 
 This repository includes an opt-in runner. Starting `run` is an explicit
 execution action: it still requires an APPROVED queue row and both approval
-references. The runner starts one item, waits for that process to exit, writes
-a durable local result record, and invokes the read-only Experiment Reviewer
-before it returns. It does not automatically start the next experiment.
+references. By default the launch command hands one item to a detached worker
+and immediately returns a task ID. The worker waits for that process to exit,
+writes a durable local result record, and invokes the read-only Experiment
+Reviewer without requiring another foreground message. Submission is not
+completion. Use `status` to verify execution and review. The worker does not
+automatically start the next experiment.
 
 The review may send the files named in `review_data_scope` to the model
 provider configured for OpenCode. Do not approve sensitive data for review
@@ -106,6 +109,33 @@ pending reviews, but never restarts an experiment whose process state is
 uncertain. Such runs become INTERRUPTED and need an operator to verify that
 the experiment has stopped and reconcile its actual outcome. A failed or
 uncertain review blocks queue progression until it is explicitly resolved.
+
+## Background work and the sentinel
+
+Use `task` for approved, bounded non-interactive preparation, analysis, or
+other long commands. Record an ID, command argument array, time limit,
+resource limit, and approval reference. Optional `--parent-id` links it to an
+existing task; the linked tasks have independent lifetimes and cancellation.
+Use separate output paths when tasks overlap. The default cap is four workers
+and only one experiment/review worker per project.
+
+After submitting a task, report the ID and return to the user. Keep foreground
+messages responsive: do not synchronously wait, stream logs into the chat, or
+poll indefinitely. At the next interaction or authorized progress check,
+read `status` and incremental `events`, keeping the returned event cursor.
+Events are local records; they do not wake an idle OpenCode session. Native
+synchronous subagent calls remain synchronous. Use an approved headless CLI
+command with a CLI-compatible agent if model work needs its own background
+task; keep that agent's permissions and provider data scope bounded.
+
+During managed processes the sentinel updates a heartbeat about every five
+seconds and samples resources every 30 seconds by default. Quiet-output,
+disk, RAM, and optional selected NVIDIA device warnings require inspection;
+they do not trigger an automatic kill or retry. GPU telemetry is read-only,
+disabled unless device IDs are specified, and never creates a cache pool.
+Telemetry lives in `.research/tasks/` outside the automatic reviewer scope.
+Use explicit cancellation and recovery when required. `--foreground` is an
+opt-in terminal mode, not the default for interactive agent work.
 
 ## 5. Implement and run within scope
 

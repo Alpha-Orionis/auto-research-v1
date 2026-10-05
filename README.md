@@ -4,9 +4,11 @@ Project-local OpenCode agents for planning, running, and reviewing bounded
 experiments in software, data, and model projects.
 
 The project includes a primary research agent, three reviewers, a reusable
-research workflow, blank templates, and a Python runner. Experiments run one
-at a time. After a process exits, the runner records its outcome and starts
-the read-only Experiment Reviewer. Review findings guide the next decision.
+research workflow, blank templates, and a Python runner with detached workers
+and a resource sentinel. Experiments run one at a time in the background.
+After a process exits, its worker records the outcome and starts the read-only
+Experiment Reviewer. Bounded subtasks can run alongside it, while the
+foreground conversation remains available.
 
 ## Requirements
 
@@ -73,17 +75,55 @@ experiment. Then, from the installed project's root:
 
 ```bash
 python3 scripts/experiment_runner.py run --id exp-001
+python3 scripts/experiment_runner.py status --id exp-001
 ```
 
 On Windows, use `python` instead of `python3`. Run one approved item at a
 time; earlier items and dependencies must complete review before advancing.
-The runner launches the reviewer after success, failure, or timeout. It
-returns after that review and does not select or launch the next experiment.
-`REVIEWED` means the review completed, not that the hypothesis succeeded.
+The launch command returns a task ID immediately; `submitted` confirms the
+handoff, not successful execution. Its background worker launches the reviewer
+after success, failure, or timeout, without another foreground message. It
+does not select or launch the next experiment. `REVIEWED` means the review
+completed, not that the hypothesis succeeded. Use `--foreground` only when
+you explicitly want a terminal command to wait for execution and review.
 
 Artifacts are stored under `.research/runs/<id>/`. A completed review requires
 a non-empty report and a complete OpenCode JSON event receipt. Failed or
 incomplete reviews block subsequent runs.
+
+## Background subtasks and monitoring
+
+For an approved, non-interactive script in your project:
+
+```bash
+python3 scripts/experiment_runner.py task --id prepare-001 \
+  --command-json '["python3", "scripts/prepare_inputs.py"]' \
+  --time-limit-minutes 10 --resource-limit 'one CPU process' \
+  --approval-reference 'approved preparation step' --parent-id exp-001
+python3 scripts/experiment_runner.py status
+python3 scripts/experiment_runner.py events
+python3 scripts/experiment_runner.py cancel --id prepare-001
+```
+
+Replace the script and approval reference with your actual approved plan;
+`--parent-id` is optional and refers to an existing task. Each task has its
+own logs, heartbeat, deadline, and cancellation record. The default limit is
+four simultaneous background workers, including at most one experiment or
+review worker. Parent links are for tracking; cancelling a parent does not
+cancel its independently approved children.
+
+The sentinel samples CPU, RAM, process memory, and free disk space every
+30 seconds and updates a heartbeat about every five seconds during a managed
+process. Long silence in logs and low resources produce warnings, not
+automatic termination. Optional `--gpu-ids 0,1` adds read-only NVIDIA device
+telemetry; no GPU cache pool is created. Telemetry stays in local task files,
+outside the automatic review scope.
+
+`status` and `events` read local records without waiting for completion.
+Events support `--after <next_cursor>` for incremental checks. The Research
+Agent reads these records when it is active. This repository does not add
+push notifications or wake an idle OpenCode chat. See [Usage](docs/usage.md)
+for monitoring, cancellation, and recovery details.
 
 ## Recover interrupted work
 
@@ -102,7 +142,8 @@ python3 scripts/experiment_runner.py review --id exp-001 --retry
 
 The last command is only for an explicitly authorized retry of a failed
 review. Experiment IDs are single-use; experiment retries need a new approved
-row and ID. See [Usage](docs/usage.md) for the full recovery rules.
+row and ID. Recovery commands also return background task IDs; use `status`
+to inspect them. See [Usage](docs/usage.md) for the full recovery rules.
 
 ## Limits and private data
 
@@ -110,7 +151,10 @@ Experiments execute as the current operating-system user. The runner is not
 a sandbox. Its timeout supervises the direct child process; experiment
 commands must manage any background children themselves. Resource limits
 recorded in the queue are not enforced CPU, memory, or accelerator quotas.
-Use one runner per project and machine on a local filesystem.
+Use one machine per project on a local filesystem. Registered background
+subtasks are independent workers; arbitrary descendants of a command must
+still be managed by that command. Detachment survives the launcher exiting;
+shutdown or a host that kills all descendants can stop the workers.
 
 The Experiment Reviewer is restricted to runner outputs. OpenCode sends
 review input to the configured model provider. Keep credentials and personal
@@ -128,10 +172,12 @@ defaults; inspect each public commit for your project's data.
 | `.opencode/agents/` | Research Agent and the three reviewers |
 | `.opencode/skills/research-optimization/` | Bounded research workflow |
 | `scripts/experiment_runner.py` | Execution, automatic review, and recovery |
+| `scripts/task_runtime.py` | Detached tasks, heartbeat, status, events, and cancellation |
+| `scripts/resource_monitor.py` | Read-only CPU, memory, disk, and optional NVIDIA telemetry |
 | `templates/` | Blank plans, queues, logs, reviews, and decisions |
 | `docs/usage.md` | Detailed setup, permissions, and recovery |
 | `install.sh` | Prerequisite checks and project-local installation |
-| `tests/` | Offline runner and installer checks |
+| `tests/` | Offline runner, background, monitoring, and installer checks |
 
 ## Development checks
 

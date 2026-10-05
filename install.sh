@@ -117,6 +117,8 @@ def main():
         ".opencode/agents/doc-reviewer.md",
         ".opencode/skills/research-optimization/SKILL.md",
         "scripts/experiment_runner.py",
+        "scripts/task_runtime.py",
+        "scripts/resource_monitor.py",
         "templates/project-contract.template.md",
         "templates/experiment-plan.template.md",
         "templates/experiment-queue.template.csv",

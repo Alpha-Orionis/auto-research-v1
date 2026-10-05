@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,10 +21,11 @@ from typing import Any, Callable, Iterator
 
 VERSION = 1
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-TERMINAL_OUTCOMES = {"SUCCEEDED", "FAILED", "TIMED_OUT"}
+TERMINAL_OUTCOMES = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"}
 REVIEW_AGENT = "experiment-reviewer"
 DEFAULT_REVIEW_TIMEOUT_MINUTES = 30
 MAX_REVIEW_ATTEMPTS = 3
+SUPERVISION_OBSERVER: Callable[..., None] | None = None
 
 
 class RunnerError(Exception):
@@ -32,6 +34,10 @@ class RunnerError(Exception):
 
 class ProcessStartError(RunnerError):
     """The command was not started; no child process needs recovery."""
+
+
+class ProcessCancelled(RunnerError):
+    """An explicit cancellation request stopped the managed child."""
 
 
 def utc_now() -> str:
@@ -98,6 +104,20 @@ def process_lock(path: Path) -> Iterator[None]:
         handle.close()
 
 
+def replace_file(source: str | Path, destination: Path) -> None:
+    # Windows readers/antivirus can briefly hold a file without delete-sharing.
+    # Retry only access conflicts, with a short deadline; never wait indefinitely.
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_name = None
@@ -111,7 +131,7 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        replace_file(temp_name, path)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -203,7 +223,7 @@ def write_queue(path: Path, fields: list[str], rows: list[dict[str, str]]) -> No
             writer.writerows(rows)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        replace_file(temp_name, path)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -386,19 +406,30 @@ def supervise(
         try:
             child = subprocess.Popen(
                 argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stdout_file,
-                stderr=stderr_file, shell=False,
+                stderr=stderr_file, shell=False, close_fds=True,
+                start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except (OSError, ValueError) as exc:
             raise ProcessStartError("The child process could not be started.") from exc
         try:
             on_started(child.pid)
             timed_out = False
-            try:
-                return_code = child.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                stop_child(child)
-                return_code = child.returncode
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                if SUPERVISION_OBSERVER is not None:
+                    SUPERVISION_OBSERVER(child, stdout_path, stderr_path)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 and child.poll() is None:
+                    timed_out = True
+                    stop_child(child)
+                    return_code = child.returncode
+                    break
+                try:
+                    return_code = child.wait(timeout=max(0, min(1, remaining)))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             for handle in (stdout_file, stderr_file):
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -446,7 +477,7 @@ def save_review_report(path: Path, report: str) -> None:
         handle.write(report)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    replace_file(temp_path, path)
 
 
 def approved_command(root: Path, row: dict[str, str]) -> tuple[list[str], Path, int]:
@@ -595,6 +626,7 @@ def run_experiment(
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
     timed_out = False
+    cancelled = False
 
     def started(pid: int) -> None:
         record["pid"] = pid
@@ -608,14 +640,19 @@ def run_experiment(
     except ProcessStartError as exc:
         record["execution_error"] = str(exc)
         return_code = 127
+    except ProcessCancelled:
+        cancelled = True
+        return_code = 130
 
     record["pid"] = None
     record["return_code"] = return_code
-    record["outcome"] = "TIMED_OUT" if timed_out else ("SUCCEEDED" if return_code == 0 else "FAILED")
+    record["outcome"] = "CANCELLED" if cancelled else ("TIMED_OUT" if timed_out else ("SUCCEEDED" if return_code == 0 else "FAILED"))
     record["status"] = "REVIEW_PENDING"
     record["finished_at"] = utc_now()
     persist(state_path, state, queue_path, fields, rows, experiment_id)
     write_manifest(run_dir, record)
+    if cancelled:
+        raise ProcessCancelled("Experiment cancelled; its evidence is pending an explicit review.")
     run_review(root, queue_path, fields, rows, state_path, state, experiment_id, opencode_command=review_prefix)
 
 
@@ -683,6 +720,7 @@ def run_review(
         review_prompt(record, root),
     ]
     return_code: int | None = None
+    cancelled = False
 
     def started(pid: int) -> None:
         record["review_pid"] = pid
@@ -700,6 +738,10 @@ def run_review(
     except ProcessStartError as exc:
         record["review_error"] = str(exc)
         return_code = 127
+    except ProcessCancelled:
+        cancelled = True
+        record["review_error"] = "Review cancellation was explicitly requested."
+        return_code = 130
 
     record["review_pid"] = None
     record["review_return_code"] = return_code
@@ -721,6 +763,8 @@ def run_review(
     persist(state_path, state, queue_path, fields, rows, experiment_id)
     write_manifest(run_dir, record)
 
+    if cancelled:
+        raise ProcessCancelled("Review cancelled; an explicit retry is required.")
     if record.get("status") != "REVIEWED":
         raise RunnerError(f"Experiment review did not complete successfully; see {record.get('review_error')}.")
 
@@ -784,7 +828,7 @@ def reconcile(
     if not record or record.get("status") != "INTERRUPTED":
         raise RunnerError("Only an INTERRUPTED experiment can be reconciled.")
     if outcome not in TERMINAL_OUTCOMES:
-        raise RunnerError("Outcome must be SUCCEEDED, FAILED, or TIMED_OUT.")
+        raise RunnerError("Outcome must be SUCCEEDED, FAILED, TIMED_OUT, or CANCELLED.")
     if pid_is_alive(record.get("pid")):
         raise RunnerError("The recorded experiment may still be alive; verify it has stopped before reconciliation.")
     if (outcome == "SUCCEEDED" and return_code != 0) or (outcome == "FAILED" and return_code == 0):
@@ -816,12 +860,34 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--id", required=True)
     reconcile_parser.add_argument("--outcome", required=True, choices=sorted(TERMINAL_OUTCOMES))
     reconcile_parser.add_argument("--return-code", required=True, type=int)
-    subparsers.add_parser("recover", help="Resume pending reviews and mark uncertain runs safely.")
+    recover_parser = subparsers.add_parser("recover", help="Resume pending reviews and mark uncertain runs safely.")
+    task_parser = subparsers.add_parser("task", help="Start an approved background command/subtask.")
+    task_parser.add_argument("--id", required=True)
+    task_parser.add_argument("--command-json", required=True)
+    task_parser.add_argument("--working-directory", default=".")
+    task_parser.add_argument("--time-limit-minutes", required=True, type=int)
+    task_parser.add_argument("--resource-limit", required=True)
+    task_parser.add_argument("--approval-reference", required=True)
+    task_parser.add_argument("--parent-id")
+    for command_parser in (run_parser, review_parser, reconcile_parser, recover_parser, task_parser):
+        command_parser.add_argument("--sample-seconds", type=float, default=30)
+        command_parser.add_argument("--stall-seconds", type=float, default=900, help="Quiet-output warning threshold; does not kill a task.")
+        command_parser.add_argument("--gpu-ids", default="", help="Optional numeric NVIDIA device IDs for read-only telemetry.")
+        command_parser.add_argument("--max-background-jobs", type=int, default=4)
+        if command_parser is not task_parser:
+            command_parser.add_argument("--foreground", action="store_true", help="Explicit synchronous mode for terminals or offline checks.")
+    status_parser = subparsers.add_parser("status", help="Read task and experiment state without waiting or acquiring the execution lock.")
+    status_parser.add_argument("--id")
+    events_parser = subparsers.add_parser("events", help="Read compact local completion/warning events.")
+    events_parser.add_argument("--after")
+    events_parser.add_argument("--limit", type=int, default=20)
+    cancel_parser = subparsers.add_parser("cancel", help="Request cancellation of one managed task.")
+    cancel_parser.add_argument("--id", required=True)
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     root = args.project.resolve()
     if not root.is_dir():
         raise RunnerError(f"Project directory does not exist: {root}")
@@ -838,6 +904,15 @@ def main() -> int:
         queue_path.relative_to(root)
     except ValueError as exc:
         raise RunnerError("Queue file must be inside the project directory.") from exc
+    if args.action in {"task", "status", "events", "cancel"} or not getattr(args, "foreground", False):
+        try:
+            import task_runtime
+        except ModuleNotFoundError as exc:
+            raise RunnerError("Install task_runtime.py and resource_monitor.py alongside the runner.") from exc
+        try:
+            return task_runtime.dispatch(args, root, queue_path, opencode_command)
+        except task_runtime.runner.RunnerError as exc:
+            raise RunnerError(str(exc)) from exc
     state_path = contained_path(root, ".research/runner/state.json", "State path")
     lock_path = contained_path(root, ".research/runner/runner.lock", "Lock path")
 
