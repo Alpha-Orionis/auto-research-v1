@@ -37,7 +37,14 @@ assert re.search(r"^mode:\\s*(all|primary)\\s*$", Path(".opencode/agents", agent
 with Path("review-calls.txt").open("a") as handle:
     handle.write("x")
 time.sleep(float(os.environ.get("BACKGROUND_REVIEW_DELAY", "0")))
-print(json.dumps({"type":"text","part":{"text":"Synthetic review completed with evidence."}}))
+identity_match = re.search(r"completed experiment ([A-Za-z0-9._-]+)", sys.argv[-1])
+identity = identity_match.group(1).rstrip(".") if identity_match else "synthetic"
+report = dict(schema_version=1, experiment_id=identity, assessment="INCONCLUSIVE",
+              correctness=dict(verdict="UNKNOWN", reason="Synthetic review"),
+              constraints=dict(verdict="PASS", reason="Synthetic scope inspected"),
+              evidence=[dict(path=f".research/runs/{identity}/stdout.log", finding="Synthetic evidence inspected")],
+              missing_evidence=["real validation"], next_options=[dict(priority=1, action="validate", rationale="Synthetic only")])
+print(json.dumps({"type":"text","part":{"text":"REVIEW_REPORT " + json.dumps(report)}}))
 print(json.dumps({"type":"step_finish","part":{"reason":"stop"}}))
 '''
 
@@ -162,7 +169,7 @@ class BackgroundChecks(unittest.TestCase):
         for agent in ("doc-reviewer", "paper-reviewer"):
             finished = self.wait_record(agent, lambda item: item["status"] == "SUCCEEDED")
             report = runtime.runner.parse_review_events(self.root / finished["stdout_reference"])
-            self.assertIn("Synthetic review completed", report)
+            self.assertIn("REVIEW_REPORT", report)
 
     def test_quiet_output_warns_without_killing_a_healthy_task(self):
         self.task("quiet-task", "import time; time.sleep(3)", "--stall-seconds", "0.1")

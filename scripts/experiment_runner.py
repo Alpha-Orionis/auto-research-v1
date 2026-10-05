@@ -18,6 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+# Also support importlib-based installer/test loading from outside scripts/.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from process_control import Workload, process_members
+from evidence_bundle import prepare as prepare_evidence, finalize as finalize_evidence, validate_review
+
 
 VERSION = 1
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -243,14 +249,64 @@ def update_queue(
     experiment_id: str,
     record: dict[str, Any],
 ) -> None:
-    row = queue_item(rows, experiment_id)
-    row["status"] = str(record.get("status", row.get("status", "")))
-    row["outcome"] = str(record.get("outcome") or "")
-    row["started_at"] = str(record.get("started_at") or "")
-    row["finished_at"] = str(record.get("finished_at") or "")
-    row["result_reference"] = str(record.get("result_reference") or "")
-    row["review_result_reference"] = str(record.get("review_result_reference") or "")
-    write_queue(queue_path, fields, rows)
+    merge_queue_state(queue_path, fields, rows, {experiment_id: record})
+
+
+@contextmanager
+def queue_lock(path: Path) -> Iterator[None]:
+    deadline = time.monotonic() + 5
+    while True:
+        lock = process_lock(path.with_suffix(path.suffix + ".lock"))
+        try:
+            lock.__enter__()
+            break
+        except RunnerError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def merge_queue_state(queue_path, fields, rows, records):
+    # Reload under the same short lock used by Main's queue-upsert command.
+    # Only runtime-owned columns are merged; new ideas/edits survive.
+    with queue_lock(queue_path):
+        current_fields, current_rows = read_queue(queue_path)
+        for experiment_id, record in records.items():
+            row = queue_item(current_rows, experiment_id)
+            for name in ("status", "outcome", "started_at", "finished_at", "result_reference", "review_result_reference"):
+                row[name] = str(record.get(name) or "")
+        write_queue(queue_path, current_fields, current_rows)
+    fields[:] = current_fields
+    rows[:] = current_rows
+
+
+def upsert_queue(queue_path, changes):
+    if not isinstance(changes, dict) or not changes.get("id"):
+        raise RunnerError("Queue update needs an object with an id.")
+    validate_id(changes["id"])
+    with queue_lock(queue_path):
+        fields, rows = read_queue(queue_path)
+        if any(key not in fields or not isinstance(value, str) for key, value in changes.items()):
+            raise RunnerError("Queue update fields must be known string-valued columns.")
+        matches = [row for row in rows if row["id"] == changes["id"]]
+        if matches:
+            if matches[0]["status"] not in {"IDEA", "READY", "APPROVED", "CANCELLED"}:
+                raise RunnerError("Do not edit a submitted experiment; create a new ID.")
+            matches[0].update(changes)
+        else:
+            rows.append(dict(dict.fromkeys(fields, ""), **changes))
+        # Validate the full prospective queue without replacing the live file.
+        scratch = queue_path.with_suffix(".validate.tmp")
+        try:
+            write_queue(scratch, fields, rows)
+            read_queue(scratch)
+        finally:
+            scratch.unlink(missing_ok=True)
+        write_queue(queue_path, fields, rows)
 
 
 def sync_queue_from_state(
@@ -259,24 +315,8 @@ def sync_queue_from_state(
     rows: list[dict[str, str]],
     state: dict[str, Any],
 ) -> None:
-    by_id: dict[str, list[dict[str, str]]] = {}
-    for row in rows:
-        by_id.setdefault(row.get("id", "").strip(), []).append(row)
-    for experiment_id, record in state["experiments"].items():
-        matches = by_id.get(experiment_id, [])
-        if len(matches) != 1:
-            raise RunnerError(
-                f"Runner state for {experiment_id!r} has no unique matching queue row; restore the row before recovery."
-            )
-        row = matches[0]
-        row["status"] = str(record.get("status", row.get("status", "")))
-        row["outcome"] = str(record.get("outcome") or "")
-        row["started_at"] = str(record.get("started_at") or "")
-        row["finished_at"] = str(record.get("finished_at") or "")
-        row["result_reference"] = str(record.get("result_reference") or "")
-        row["review_result_reference"] = str(record.get("review_result_reference") or "")
     if state["experiments"]:
-        write_queue(queue_path, fields, rows)
+        merge_queue_state(queue_path, fields, rows, state["experiments"])
 
 
 def persist(
@@ -343,6 +383,14 @@ def pid_is_alive(pid: int | None) -> bool:
     return True
 
 
+def recorded_workload_alive(record, review=False):
+    pid = record.get("review_pid" if review else "pid")
+    if pid_is_alive(pid):
+        return True
+    group = record.get("review_process_group_id" if review else "process_group_id")
+    return bool(group and os.name != "nt" and process_members(group))
+
+
 def validate_id(experiment_id: str) -> None:
     if not ID_PATTERN.fullmatch(experiment_id):
         raise RunnerError("Experiment id must use 1-64 letters, digits, dots, underscores, or hyphens.")
@@ -397,6 +445,9 @@ def reviewer_command(root: Path, prefix: list[str] | None) -> list[str]:
 
 
 def stop_child(child: subprocess.Popen[Any]) -> None:
+    if getattr(child, "workload", None) is not None:
+        child.workload.stop()
+        return
     if child.poll() is not None:
         return
     child.terminate()
@@ -409,16 +460,16 @@ def stop_child(child: subprocess.Popen[Any]) -> None:
 
 def supervise(
     argv: list[str], cwd: Path, stdout_path: Path, stderr_path: Path,
-    timeout_seconds: int, on_started: Callable[[int], None],
+    timeout_seconds: int, on_started: Callable[[int], None], env=None,
 ) -> tuple[int, bool]:
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         try:
-            child = subprocess.Popen(
+            workload = Workload(
                 argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stdout_file,
-                stderr=stderr_file, shell=False, close_fds=True,
-                start_new_session=os.name != "nt",
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                stderr=stderr_file, env=env,
             )
+            child = workload.child
+            child.workload = workload
         except (OSError, ValueError) as exc:
             raise ProcessStartError("The child process could not be started.") from exc
         try:
@@ -431,7 +482,7 @@ def supervise(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 and child.poll() is None:
                     timed_out = True
-                    stop_child(child)
+                    workload.stop()
                     return_code = child.returncode
                     break
                 try:
@@ -439,6 +490,16 @@ def supervise(
                     break
                 except subprocess.TimeoutExpired:
                     continue
+            # Job accounting can briefly lag the signalled process handle.
+            settled = time.monotonic() + 0.25
+            while workload.active() and time.monotonic() < settled:
+                time.sleep(0.01)
+            if workload.active():
+                # A parent that exits while descendants continue is not a
+                # completed experiment; clean up before releasing reservations.
+                workload.stop()
+                if return_code == 0:
+                    return_code = 125
             for handle in (stdout_file, stderr_file):
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -446,11 +507,13 @@ def supervise(
         except BaseException:
             # Storage errors and interruption must not leave a child running
             # while the caller records a terminal outcome or launches review.
-            stop_child(child)
+            workload.stop()
             raise
+        finally:
+            workload.close()
 
 
-def parse_review_events(path: Path) -> str:
+def parse_review_events(path: Path, experiment_id=None) -> str:
     texts: list[str] = []
     last_reason: str | None = None
     try:
@@ -477,7 +540,12 @@ def parse_review_events(path: Path) -> str:
         raise RunnerError("Invalid OpenCode JSON event output; review was not marked complete.") from exc
     if not texts or last_reason != "stop":
         raise RunnerError("OpenCode did not return a complete review report and final stop event.")
-    return "\n\n".join(texts) + "\n"
+    text = "\n\n".join(texts) + "\n"
+    try:
+        validate_review(text, experiment_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RunnerError(str(exc)) from exc
+    return text
 
 
 def save_review_report(path: Path, report: str) -> None:
@@ -533,6 +601,14 @@ def check_dependencies(
         record = state["experiments"].get(dependency, {})
         if record.get("status") != "REVIEWED":
             raise RunnerError(f"Dependency {dependency!r} has not completed review.")
+        policy = row.get("dependency_policy", "").strip() or "accepted_artifacts"
+        if policy not in {"accepted_artifacts", "reviewed"}:
+            raise RunnerError("dependency_policy must be accepted_artifacts or explicitly reviewed.")
+        if policy == "accepted_artifacts" and not (
+            record.get("outcome") == "SUCCEEDED" and record.get("artifacts_valid") is True
+            and record.get("decision", {}).get("assessment") == "ACCEPTED"
+        ):
+            raise RunnerError(f"Dependency {dependency!r} needs successful, accepted, valid artifacts.")
 
 
 def check_queue_order(
@@ -555,16 +631,33 @@ def check_queue_order(
             continue
         earlier_status = earlier.get("status", "").strip().upper()
         earlier_id = (earlier.get("id") or "").strip()
-        has_review_record = state["experiments"].get(earlier_id, {}).get("status") == "REVIEWED"
+        prior = state["experiments"].get(earlier_id, {})
+        has_review_record = prior.get("status") == "REVIEWED" and bool(prior.get("decision"))
         if earlier_status != "CANCELLED" and not (earlier_status == "REVIEWED" and has_review_record):
             raise RunnerError(
                 f"Earlier queue item {earlier.get('id')!r} is {earlier_status or 'UNSET'}; "
-                "review or cancel it before advancing."
+                "review and record Main's decision, or cancel it before advancing."
             )
 
 
 def write_manifest(run_dir: Path, record: dict[str, Any]) -> None:
     atomic_json(run_dir / "manifest.json", record)
+
+
+def claim_experiment(queue_path, fields, rows, state_path, state, approved_row, record):
+    with queue_lock(queue_path):
+        latest_fields, latest_rows = read_queue(queue_path)
+        current = queue_item(latest_rows, record["id"])
+        if current != approved_row:
+            raise RunnerError("Experiment definition or approval changed during preflight; no workload started.")
+        check_queue_order(current, latest_rows, state)
+        check_dependencies(current, latest_rows, state)
+        state["experiments"][record["id"]] = record
+        atomic_json(state_path, state)
+        for name in ("status", "outcome", "started_at", "finished_at", "result_reference", "review_result_reference"):
+            current[name] = str(record.get(name) or "")
+        write_queue(queue_path, latest_fields, latest_rows)
+    fields[:], rows[:] = latest_fields, latest_rows
 
 
 def run_experiment(
@@ -576,6 +669,7 @@ def run_experiment(
     state: dict[str, Any],
     experiment_id: str,
     opencode_command: list[str] | None = None,
+    gpu_ids=(),
 ) -> None:
     validate_id(experiment_id)
     if experiment_id in state["experiments"]:
@@ -590,6 +684,7 @@ def run_experiment(
             + ", ".join(unresolved)
         )
     row = queue_item(rows, experiment_id)
+    approved_row = dict(row)
     check_queue_order(row, rows, state)
     check_dependencies(row, rows, state)
     argv, cwd, timeout_minutes = approved_command(root, row)
@@ -599,6 +694,10 @@ def run_experiment(
     if run_dir.exists():
         raise RunnerError(f"Run directory already exists; refusing to overwrite: {run_dir}")
     run_dir.mkdir(parents=True)
+    try:
+        execution_evidence = prepare_evidence(root, run_dir, row, argv, atomic_json)
+    except (OSError, ValueError, TypeError) as exc:
+        raise RunnerError("Cannot prepare approved evidence bundle: " + str(exc)) from exc
     record: dict[str, Any] = {
         "id": experiment_id,
         "status": "RUNNING",
@@ -627,9 +726,12 @@ def run_experiment(
         "review_return_code": None,
         "review_pid": None,
         "review_error": None,
+        "evidence_review_approved": row.get("evidence_review_approved", "").strip().lower() == "true",
+        "execution_evidence_reference": (run_dir / "evidence/execution.json").relative_to(root).as_posix(),
+        "gpu_ids": list(gpu_ids),
+        "required_artifact_count": len(execution_evidence["required_artifacts"]),
     }
-    state["experiments"][experiment_id] = record
-    persist(state_path, state, queue_path, fields, rows, experiment_id)
+    claim_experiment(queue_path, fields, rows, state_path, state, approved_row, record)
     write_manifest(run_dir, record)
 
     stdout_path = run_dir / "stdout.log"
@@ -639,12 +741,14 @@ def run_experiment(
 
     def started(pid: int) -> None:
         record["pid"] = pid
+        record["process_group_id"] = pid if os.name != "nt" else None
         persist(state_path, state, queue_path, fields, rows, experiment_id)
         write_manifest(run_dir, record)
 
     try:
         return_code, timed_out = supervise(
             argv, cwd, stdout_path, stderr_path, timeout_minutes * 60, started,
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, gpu_ids))),
         )
     except ProcessStartError as exc:
         record["execution_error"] = str(exc)
@@ -658,6 +762,14 @@ def run_experiment(
     record["outcome"] = "CANCELLED" if cancelled else ("TIMED_OUT" if timed_out else ("SUCCEEDED" if return_code == 0 else "FAILED"))
     record["status"] = "REVIEW_PENDING"
     record["finished_at"] = utc_now()
+    record["workload_cleanup_verified"] = True
+    try:
+        evidence = finalize_evidence(root, run_dir, execution_evidence, atomic_json)
+        record["artifacts_valid"] = evidence["artifacts_valid"]
+        record["results_evidence_reference"] = (run_dir / "evidence/results.json").relative_to(root).as_posix()
+    except (OSError, ValueError, TypeError) as exc:
+        record["artifacts_valid"] = False
+        record["evidence_error"] = str(exc)
     persist(state_path, state, queue_path, fields, rows, experiment_id)
     write_manifest(run_dir, record)
     if cancelled:
@@ -684,9 +796,16 @@ def review_prompt(record: dict[str, Any], root: Path) -> str:
         f"Run manifest (project-relative): {record['result_reference']}\n"
         f"Standard output (project-relative): {record['stdout']}\n"
         f"Standard error (project-relative): {record['stderr']}\n\n"
-        "Return an evidence-based review with an overall assessment, prioritized findings, "
-        "evidence locations, limitations, and questions requiring author confirmation. "
-        "A zero exit code is not proof that the hypothesis succeeded."
+        + (f"Approved evidence bundle: {record.get('execution_evidence_reference')}, "
+         f"{record.get('results_evidence_reference')}\n" if record.get("evidence_review_approved") else
+         "Evidence bundle is NOT approved for model review; inspect only the manifest and logs.\n")
+        + "Return REVIEW_REPORT followed by one JSON object with schema_version:1, "
+        "experiment_id, assessment (VALID/INVALID/INCONCLUSIVE), correctness and constraints "
+        "(each {verdict:PASS/FAIL/UNKNOWN,reason}), evidence [{path,finding}], "
+        "missing_evidence [strings], next_options [{priority,action,rationale}]. "
+        "Evidence paths must be project-relative files in this run. VALID requires both PASS "
+        "and no missing evidence. A zero exit code is not proof of hypothesis success. "
+        "Main alone records the final decision and chooses the next experiment."
     )
 
 
@@ -710,7 +829,7 @@ def run_review(
         raise RunnerError(f"Review cannot start from state {record.get('status')!r}.")
     if int(record.get("review_attempts", 0)) >= MAX_REVIEW_ATTEMPTS:
         raise RunnerError(f"Review attempt limit ({MAX_REVIEW_ATTEMPTS}) reached.")
-    if pid_is_alive(record.get("review_pid")):
+    if recorded_workload_alive(record, review=True):
         raise RunnerError("The recorded reviewer may still be running; refusing to start a duplicate.")
     prefix = reviewer_command(root, opencode_command)
     run_dir = contained_path(root, f".research/runs/{experiment_id}", "Run directory")
@@ -733,6 +852,7 @@ def run_review(
 
     def started(pid: int) -> None:
         record["review_pid"] = pid
+        record["review_process_group_id"] = pid if os.name != "nt" else None
         persist(state_path, state, queue_path, fields, rows, experiment_id)
         write_manifest(run_dir, record)
 
@@ -758,11 +878,15 @@ def run_review(
     report: str | None = None
     if return_code == 0:
         try:
-            report = parse_review_events(event_log)
+            report = parse_review_events(event_log, experiment_id)
+            validate_review_scope(root, run_dir, record, report)
         except RunnerError as exc:
             record["review_error"] = str(exc)
     if report is not None:
         save_review_report(run_dir / "review.md", report)
+        structured = validate_review(report, experiment_id)
+        atomic_json(run_dir / "review-report.json", structured)
+        record["review_assessment"] = structured["assessment"]
         record["status"] = "REVIEWED"
         record["review_result_reference"] = (run_dir / "review.md").relative_to(root).as_posix()
     else:
@@ -776,6 +900,21 @@ def run_review(
         raise ProcessCancelled("Review cancelled; an explicit retry is required.")
     if record.get("status") != "REVIEWED":
         raise RunnerError(f"Experiment review did not complete successfully; see {record.get('review_error')}.")
+
+
+def validate_review_scope(root, run_dir, record, report):
+    reviewed = validate_review(report, record["id"])
+    if reviewed["assessment"] == "VALID" and (
+        record.get("outcome") != "SUCCEEDED" or record.get("evidence_error")
+        or (record.get("required_artifact_count", 0) and not record.get("artifacts_valid"))
+    ):
+        raise RunnerError("VALID review contradicts failed execution or missing/stale evidence.")
+    for item in reviewed["evidence"]:
+        path = contained_path(root, item["path"], "Review evidence")
+        allowed = path.name in {"manifest.json", "stdout.log", "stderr.log"} and path.parent == run_dir
+        allowed = allowed or (record.get("evidence_review_approved") and path.is_relative_to(run_dir / "evidence"))
+        if not path.is_file() or not allowed:
+            raise RunnerError("Review cites missing or unapproved evidence.")
 
 
 def recover(
@@ -792,23 +931,27 @@ def recover(
         if status == "REVIEW_PENDING":
             print(f"Resuming pending review: {experiment_id}")
             run_review(root, queue_path, fields, rows, state_path, state, experiment_id, opencode_command=opencode_command)
-        elif status == "RUNNING" and not pid_is_alive(record.get("pid")):
+        elif status == "RUNNING" and not recorded_workload_alive(record):
             record["status"] = "INTERRUPTED"
             record["finished_at"] = utc_now()
             record["recovery_note"] = "Runner stopped before recording a definitive process outcome; experiment was not restarted."
             persist(state_path, state, queue_path, fields, rows, experiment_id)
             write_manifest(root / ".research" / "runs" / experiment_id, record)
             print(f"Marked uncertain experiment as INTERRUPTED: {experiment_id}")
-        elif status == "REVIEWING" and not pid_is_alive(record.get("review_pid")):
+        elif status == "REVIEWING" and not recorded_workload_alive(record, review=True):
             record["review_pid"] = None
             run_dir = contained_path(root, f".research/runs/{experiment_id}", "Run directory")
             try:
-                report = parse_review_events(run_dir / f"review-attempt-{record.get('review_attempts')}.events.jsonl")
+                report = parse_review_events(run_dir / f"review-attempt-{record.get('review_attempts')}.events.jsonl", experiment_id)
+                validate_review_scope(root, run_dir, record, report)
             except RunnerError:
                 record["status"] = "REVIEW_FAILED"
                 record["review_error"] = "Runner stopped during review without a complete receipt; inspect the event log before an explicit retry."
             else:
                 save_review_report(run_dir / "review.md", report)
+                structured = validate_review(report, experiment_id)
+                atomic_json(run_dir / "review-report.json", structured)
+                record["review_assessment"] = structured["assessment"]
                 record["status"] = "REVIEWED"
                 record["review_error"] = None
                 record["review_finished_at"] = utc_now()
@@ -838,7 +981,7 @@ def reconcile(
         raise RunnerError("Only an INTERRUPTED experiment can be reconciled.")
     if outcome not in TERMINAL_OUTCOMES:
         raise RunnerError("Outcome must be SUCCEEDED, FAILED, TIMED_OUT, or CANCELLED.")
-    if pid_is_alive(record.get("pid")):
+    if recorded_workload_alive(record):
         raise RunnerError("The recorded experiment may still be alive; verify it has stopped before reconciliation.")
     if (outcome == "SUCCEEDED" and return_code != 0) or (outcome == "FAILED" and return_code == 0):
         raise RunnerError("Outcome and return code are inconsistent.")
@@ -881,7 +1024,10 @@ def build_parser() -> argparse.ArgumentParser:
     for command_parser in (run_parser, review_parser, reconcile_parser, recover_parser, task_parser):
         command_parser.add_argument("--sample-seconds", type=float, default=30)
         command_parser.add_argument("--stall-seconds", type=float, default=900, help="Quiet-output warning threshold; does not kill a task.")
-        command_parser.add_argument("--gpu-ids", default="", help="Optional numeric NVIDIA device IDs for read-only telemetry.")
+        command_parser.add_argument("--gpu-ids", default="", help="Reserve and monitor these NVIDIA devices; omitted means CPU-only (CUDA hidden).")
+        command_parser.add_argument("--gpu-window-seconds", type=float, default=300)
+        command_parser.add_argument("--gpu-low-threshold", type=float, default=30)
+        command_parser.add_argument("--gpu-bad-windows", type=int, default=3)
         command_parser.add_argument("--max-background-jobs", type=int, default=4)
         if command_parser is not task_parser:
             command_parser.add_argument("--foreground", action="store_true", help="Explicit synchronous mode for terminals or offline checks.")
@@ -894,6 +1040,24 @@ def build_parser() -> argparse.ArgumentParser:
     events_parser.add_argument("--limit", type=int, default=20)
     cancel_parser = subparsers.add_parser("cancel", help="Request cancellation of one managed task.")
     cancel_parser.add_argument("--id", required=True)
+    queue_parser = subparsers.add_parser("queue-upsert", help="Merge one queue row under the shared short lock.")
+    queue_parser.add_argument("--row-json", required=True)
+    decision_parser = subparsers.add_parser("decide", help="Record Main's final scientific decision.")
+    decision_parser.add_argument("--id", required=True)
+    decision_parser.add_argument("--assessment", required=True, choices=("ACCEPTED", "REJECTED", "INCONCLUSIVE"))
+    decision_parser.add_argument("--rationale", required=True)
+    decision_parser.add_argument("--next-id")
+    ack_parser = subparsers.add_parser("ack", help="Acknowledge a completion only after Main records a decision.")
+    ack_parser.add_argument("--event-id", required=True)
+    ack_parser.add_argument("--id", required=True)
+    bridge_parser = subparsers.add_parser("bridge", help="Bounded local completion-to-Main wake/advance loop.")
+    bridge_parser.add_argument("--config", required=True)
+    bridge_parser.add_argument("--once", action="store_true")
+    seal_parser = subparsers.add_parser("bridge-seal", help="Explicitly approve and fingerprint a bounded next-experiment batch.")
+    seal_parser.add_argument("--config", required=True)
+    seal_parser.add_argument("--approval-reference", required=True)
+    advance_parser = subparsers.add_parser("advance", help="Launch Main's chosen next item within approved loop bounds.")
+    advance_parser.add_argument("--config", required=True)
     return parser
 
 
@@ -915,7 +1079,24 @@ def main(argv: list[str] | None = None) -> int:
         queue_path.relative_to(root)
     except ValueError as exc:
         raise RunnerError("Queue file must be inside the project directory.") from exc
-    if args.action in {"task", "status", "alerts", "events", "cancel"} or not getattr(args, "foreground", False):
+    if args.action == "queue-upsert":
+        try:
+            upsert_queue(queue_path, json.loads(args.row_json))
+        except ValueError as exc:
+            raise RunnerError("Invalid queue update: " + str(exc)) from exc
+        return 0
+    if args.action in {"bridge", "bridge-seal", "advance", "ack"}:
+        import main_bridge
+        if args.action == "ack":
+            main_bridge.acknowledge(root, args.event_id, args.id)
+        elif args.action == "bridge-seal":
+            main_bridge.seal(root, args.config, args.approval_reference)
+        elif args.action == "advance":
+            print(json.dumps(main_bridge.advance(root, main_bridge.load_config(root, args.config))))
+        else:
+            main_bridge.run(root, args.config, once=args.once)
+        return 0
+    if args.action in {"task", "status", "alerts", "events", "cancel"} or (args.action != "decide" and not getattr(args, "foreground", False)):
         try:
             import task_runtime
         except ModuleNotFoundError as exc:
@@ -927,7 +1108,14 @@ def main(argv: list[str] | None = None) -> int:
     state_path = contained_path(root, ".research/runner/state.json", "State path")
     lock_path = contained_path(root, ".research/runner/runner.lock", "Lock path")
 
-    with process_lock(lock_path):
+    from gpu_reservation import reserve
+    gpu_ids = []
+    if args.action != "decide":
+        import task_runtime
+        gpu_ids = task_runtime.monitor_options(args)["gpu_ids"]
+    # A background worker already owns these locks in this same process.
+    reservation_ids = [] if SUPERVISION_OBSERVER is not None else gpu_ids
+    with reserve(root, reservation_ids, process_lock, contained_path), process_lock(lock_path):
         fields, rows = read_queue(queue_path)
         state = read_state(state_path)
         for experiment_id, record in state["experiments"].items():
@@ -936,8 +1124,25 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError(f"Run artifacts are missing for {experiment_id!r}; restore them before recovery.")
             write_manifest(run_dir, record)
         sync_queue_from_state(queue_path, fields, rows, state)
+        if args.action == "decide":
+            record = state["experiments"].get(args.id, {})
+            if record.get("status") != "REVIEWED" or not args.rationale.strip():
+                raise RunnerError("Main must inspect a completed review and give a decision rationale.")
+            if args.assessment == "ACCEPTED" and (record.get("outcome") != "SUCCEEDED" or record.get("review_assessment") != "VALID" or record.get("evidence_error") or (record.get("required_artifact_count", 0) and not record.get("artifacts_valid"))):
+                raise RunnerError("An unsuccessful, invalid or incomplete result cannot be accepted.")
+            if args.next_id:
+                validate_id(args.next_id)
+                if args.next_id == args.id:
+                    raise RunnerError("Next experiment must use a new ID.")
+                queue_item(rows, args.next_id)
+            decision = dict(experiment_id=args.id, assessment=args.assessment, rationale=args.rationale,
+                            next_id=args.next_id, decided_at=utc_now())
+            record["decision"] = decision
+            atomic_json(root / ".research/runs" / args.id / "decision.json", decision)
+            persist(state_path, state, queue_path, fields, rows, args.id)
+            write_manifest(root / ".research/runs" / args.id, record)
         if args.action == "run":
-            run_experiment(root, queue_path, fields, rows, state_path, state, args.id, opencode_command)
+            run_experiment(root, queue_path, fields, rows, state_path, state, args.id, opencode_command, gpu_ids=gpu_ids)
         elif args.action == "review":
             run_review(root, queue_path, fields, rows, state_path, state, args.id, retry=args.retry, opencode_command=opencode_command)
         elif args.action == "reconcile":

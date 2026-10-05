@@ -22,7 +22,7 @@ SPEC = importlib.util.spec_from_file_location("experiment_runner", PROJECT / "sc
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
-FAKE_OPENCODE = '''import json, os, sys
+FAKE_OPENCODE = '''import json, os, sys, re
 from pathlib import Path
 if "--version" in sys.argv:
     print(os.environ.get("RUNNER_TEST_VERSION", "1.2.99"))
@@ -39,8 +39,16 @@ if behavior == "fallback":
 elif behavior == "error":
     print(json.dumps({"type": "error", "error": {"name": "ProviderError"}}))
 else:
+    identity = sys.argv[-1].splitlines()[0].removesuffix(".").rsplit(" ", 1)[1]
+    manifest = json.loads(Path(f".research/runs/{identity}/manifest.json").read_text())
+    valid = manifest["outcome"] == "SUCCEEDED" and not manifest.get("evidence_error") and (not manifest.get("required_artifact_count") or manifest.get("artifacts_valid"))
+    report = dict(schema_version=1, experiment_id=identity, assessment="VALID" if valid else "INVALID",
+                  correctness=dict(verdict="PASS" if valid else "FAIL", reason="Synthetic exit evidence inspected"),
+                  constraints=dict(verdict="PASS", reason="Synthetic scope inspected"),
+                  evidence=[dict(path=f".research/runs/{identity}/stdout.log", finding="Inspected synthetic evidence")],
+                  missing_evidence=[], next_options=[dict(priority=1, action="controlled next test", rationale="Compare evidence")])
     if behavior != "empty":
-        print(json.dumps({"type": "text", "part": {"text": "Review completed with evidence and limitations."}}))
+        print(json.dumps({"type": "text", "part": {"text": "REVIEW_REPORT " + json.dumps(report)}}))
     print(json.dumps({"type": "step_finish", "part": {"reason": "length" if behavior == "incomplete" else "stop"}}))
 '''
 
@@ -76,6 +84,7 @@ class RunnerChecks(unittest.TestCase):
         runner.write_queue(self.queue, self.fields, self.rows)
 
     def run_one(self):
+        runner.write_queue(self.queue, self.fields, self.rows)
         runner.run_experiment(self.root, self.queue, self.fields, self.rows, self.state_path, self.state, "exp-one", self.prefix)
         return self.state["experiments"]["exp-one"]
 
@@ -110,6 +119,7 @@ class RunnerChecks(unittest.TestCase):
                 self.rows[1]["id"] = "next-" + behavior
                 self.rows[0]["status"] = self.rows[1]["status"] = "APPROVED"
                 self.state = {"version": runner.VERSION, "experiments": {}}
+                runner.write_queue(self.queue, self.fields, self.rows)
                 with self.assertRaises(runner.RunnerError):
                     runner.run_experiment(self.root, self.queue, self.fields, self.rows, self.state_path, self.state, behavior, self.prefix)
                 self.assertEqual(self.state["experiments"][behavior]["status"], "REVIEW_FAILED")

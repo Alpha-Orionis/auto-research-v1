@@ -10,6 +10,12 @@ After a process exits, its worker records the outcome and starts the read-only
 Experiment Reviewer. Bounded subtasks can run alongside it, while the
 foreground conversation remains available.
 
+The reliability update adds whole-workload cleanup, concurrent-safe queue
+merges, structured reviews and explicit Main decisions, an opt-in bounded
+completion/wake/next-experiment bridge, GPU window averages and reservations,
+and scoped reproducibility bundles. See the canonical
+[Reliable experiment loop](docs/reliability.md) protocol.
+
 ## Requirements
 
 - Python **3.10 or newer**. The runner and installer use the standard library.
@@ -79,16 +85,19 @@ python3 scripts/experiment_runner.py status --id exp-001
 ```
 
 On Windows, use `python` instead of `python3`. Run one approved item at a
-time; earlier items and dependencies must complete review before advancing.
+time; earlier items need review and Main's final decision before advancing.
+Dependencies normally require successful, accepted, valid artifacts.
 The launch command returns a task ID immediately; `submitted` confirms the
 handoff, not successful execution. Its background worker launches the reviewer
 after success, failure, or timeout, without another foreground message. It
-does not select or launch the next experiment. `REVIEWED` means the review
+does not select the next experiment. With a sealed bounded bridge, completion
+wakes Main and the bridge launches Main's approved next choice automatically.
+`REVIEWED` means the review
 completed, not that the hypothesis succeeded. Use `--foreground` only when
 you explicitly want a terminal command to wait for execution and review.
 
 Artifacts are stored under `.research/runs/<id>/`. A completed review requires
-a non-empty report and a complete OpenCode JSON event receipt. Failed or
+a structured `REVIEW_REPORT` and a complete OpenCode JSON event receipt. Failed or
 incomplete reviews block subsequent runs.
 
 ## Background subtasks and monitoring
@@ -116,8 +125,10 @@ cancel its independently approved children.
 The sentinel samples CPU, RAM, process memory, and free disk space every
 30 seconds and updates a heartbeat about every five seconds during a managed
 process. Long silence in logs and low resources produce warnings, not
-automatic termination. Optional `--gpu-ids 0,1` adds read-only NVIDIA device
-telemetry; no GPU cache pool is created. Telemetry stays in local task files,
+automatic termination. `--gpu-ids 0,1` reserves devices and adds NVIDIA
+telemetry; omission means CPU-only with CUDA hidden. Mature time-weighted
+per-device averages and ancestry ownership reduce false alerts.
+No GPU cache pool is created. Telemetry stays in local task files,
 outside the automatic review scope.
 
 Anomalies are recorded separately in `anomalies.jsonl`, with their type,
@@ -130,8 +141,8 @@ reported through available local channels and do not trigger a task kill.
 
 `status` and `events` read local records without waiting for completion.
 Events support `--after <next_cursor>` for incremental checks. The Research
-Agent reads these records when it is active. This repository does not add
-push notifications or wake an idle OpenCode chat. See [Usage](docs/usage.md)
+Agent reads these records when active; the opt-in bounded bridge also wakes
+the same idle Main chat on completion. See [Usage](docs/usage.md)
 for monitoring, cancellation, and recovery details.
 
 ## Recover interrupted work
@@ -157,12 +168,12 @@ to inspect them. See [Usage](docs/usage.md) for the full recovery rules.
 ## Limits and private data
 
 Experiments execute as the current operating-system user. The runner is not
-a sandbox. Its timeout supervises the direct child process; experiment
-commands must manage any background children themselves. Resource limits
+a sandbox. Its timeout supervises the owned process group/Windows Job Object,
+including descendants that stay within it. Resource limits
 recorded in the queue are not enforced CPU, memory, or accelerator quotas.
 Use one machine per project on a local filesystem. Registered background
-subtasks are independent workers; arbitrary descendants of a command must
-still be managed by that command. Detachment survives the launcher exiting;
+subtasks are independent workers; deliberately detached POSIX descendants
+are outside cooperative process-group containment. Detachment survives the launcher exiting;
 shutdown or a host that kills all descendants can stop the workers.
 
 The Experiment Reviewer is restricted to runner outputs. OpenCode sends

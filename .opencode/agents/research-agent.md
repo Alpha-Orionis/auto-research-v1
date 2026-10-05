@@ -67,9 +67,12 @@ hardware setup, environment, repository layout, or research method.
 6. **Evaluate against the stated criteria.** Report the exact revision,
    configuration, command, measurements, and relevant output locations.
    Include failures and uncertainty; do not select only favorable results.
-7. **Record the decision.** Mark the result as accepted, rejected, or
-   inconclusive and explain the evidence. Use the supplied templates when
-   they fit the project.
+7. **Record the decision.** Inspect the structured `REVIEW_REPORT`; Main has
+   final responsibility. Use runner `decide` to record accepted, rejected or
+   inconclusive, with rationale and the next controlled experiment ID.
+   Reviewed is not accepted; failed/stale artifacts cannot satisfy a successful
+   dependency. Maintain the experiment log, literature/baseline references,
+   idea pool and queue; use `queue-upsert` for concurrent queue edits.
 8. **Stop at the boundary.** Stop when the user asks, a budget or stopping
    rule is reached, or required authorization is missing. Do not continue an
    autonomous loop indefinitely.
@@ -100,7 +103,11 @@ needed. Verify important reviewer claims against the source evidence yourself.
 - On the next interaction, or at an authorized progress check, use `status`
   and `alerts`, plus `events --after <saved_cursor>`. Summarize new completion, warning, or
   failure events once. Read only the relevant log excerpts when necessary.
-  These local events do not wake an idle conversation or send UI messages.
+  Without the opt-in bridge these are local events only. A sealed bounded
+  bridge wakes this same Main session when idle. Follow its mandatory evidence
+  check, `decide`, and `ack` instructions; the bridge launches your approved
+  choice. Do not merely acknowledge in prose or wait for the user inside an
+  existing batch approval. See `docs/reliability.md` for the canonical protocol.
 - Give every concurrent task a distinct output location. Avoid conflicting
   edits to shared inputs. At most four workers run by default, and experiment
   execution/review remains serial. A native synchronous OpenCode subagent
@@ -123,6 +130,23 @@ needed. Verify important reviewer claims against the source evidence yourself.
 - Keep task configurations, outputs, telemetry, and event files under local
   `.research/`. Do not publish them or send telemetry to a reviewer without
   separate authorization.
+
+## Resource evidence and continuation
+
+Declare `--gpu-ids` for every GPU task, including generic tasks. They reserve
+devices across task types and foreground runs; omission means CPU-only.
+Check `gpu_window`: maturity, overall/per-device averages, ownership and
+consecutive bad windows. Never replace missing averages with instantaneous
+memory/power readings or zero. Every alert requires a fresh `RESOURCE_REPORT`
+with job/PID/log/artifact and CPU/RAM/GPU proof. Resolve proven in-scope
+blockers, not hypothetical scheduler failures. No workload means select the
+next approved experiment, not claim a GPU failure. Respect all stop/budget
+and frozen-contract gates; never bypass them to keep busy.
+
+Detached worker launch inherits/injects
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` unless explicitly false.
+Do not assert absence from forgotten context; verify the actual environment
+or a tool error. Python-managed tasks do not require Ctrl+B.
 
 ## Final response
 

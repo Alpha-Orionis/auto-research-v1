@@ -26,6 +26,10 @@ What should improve, and why?
 - Compute or resource limit:
 - Cost limit:
 - Concurrency limit:
+- Approved autonomous batch IDs and maximum experiment count:
+- Cumulative experiment-time limit and wall-clock limit:
+- Main session/loop approval (if automatic continuation is requested):
+- Frozen individual file paths to fingerprint:
 
 ## Evaluation
 
@@ -34,6 +38,8 @@ What should improve, and why?
 - Secondary metrics:
 - Success criteria:
 - Stopping rule:
+- Required artifacts and validity/freshness checks:
+- Approved configuration/metrics/code evidence snapshots:
 
 ## Approval checkpoints
 

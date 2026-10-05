@@ -83,7 +83,9 @@ inputs, environment, and limits. A batch approval must identify the items and
 shared limits. If that scope changes, pause for approval.
 
 Run one item at a time by default. Start only an approved item whose
-dependencies are reviewed and whose preflight checks pass. Do not retry a
+dependencies have successful, accepted artifacts and whose preflight checks
+pass (an explicitly approved `dependency_policy=reviewed` is for failure
+analysis only). Do not retry a
 failed item automatically.
 Record the outcome and review before selecting the next item. If a prior item is marked
 RUNNING, verify that it has stopped before starting another; if that cannot be
@@ -96,7 +98,10 @@ and immediately returns a task ID. The worker waits for that process to exit,
 writes a durable local result record, and invokes the read-only Experiment
 Reviewer without requiring another foreground message. Submission is not
 completion. Use `status` to verify execution and review. The worker does not
-automatically start the next experiment.
+automatically start the next experiment without a sealed bounded Main bridge.
+Use `docs/reliability.md` as the canonical completion/decision/ack protocol.
+Main records the final scientific decision; the bridge launches only Main's
+approved choice, with count/time budgets and frozen-definition checks.
 
 The review may send the files named in `review_data_scope` to the model
 provider configured for OpenCode. Do not approve sensitive data for review
@@ -123,7 +128,9 @@ After submitting a task, report the ID and return to the user. Keep foreground
 messages responsive: do not synchronously wait, stream logs into the chat, or
 poll indefinitely. At the next interaction or authorized progress check,
 read `status`, `alerts`, and incremental `events`, keeping the returned event cursor.
-Events are local records; they do not wake an idle OpenCode session. Native
+Events remain local unless the bounded Main bridge is enabled. In that loop,
+investigate resources, record `decide`, and `ack`; do not wait for another
+user message within an existing batch approval. Native
 synchronous subagent calls remain synchronous. Use an approved headless CLI
 command with a CLI-compatible agent if model work needs its own background
 task; keep that agent's permissions and provider data scope bounded.
@@ -134,8 +141,10 @@ process exit alone does not prove review completion.
 During managed processes the sentinel updates a heartbeat about every five
 seconds and samples resources every 30 seconds by default. Quiet-output,
 disk, RAM, and optional selected NVIDIA device warnings require inspection;
-they do not trigger an automatic kill or retry. GPU telemetry is read-only,
-disabled unless device IDs are specified, and never creates a cache pool.
+they do not trigger an automatic kill or retry. GPU telemetry is read-only;
+device IDs also reserve cards across task types. No IDs means CPU-only with
+CUDA hidden. Mature averages, consecutive windows and ancestry ownership
+separate under-load problems from idle gaps. No cache pool is created.
 Telemetry lives in `.research/tasks/` outside the automatic reviewer scope.
 Anomaly journals record observed values, thresholds, and raised/resolved
 transitions. Unknown counters preserve stale warnings instead of claiming

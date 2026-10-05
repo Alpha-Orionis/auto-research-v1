@@ -4,6 +4,10 @@ This repository contains project-local OpenCode agent definitions, one
 reusable skill, blank templates, and an opt-in Python experiment runner with
 detached background workers and read-only monitoring. The scripts use only
 Python's standard library and require Python 3.10 or newer.
+See [Reliable experiment loop](reliability.md) for concurrent queue merging,
+structured review/Main decisions, bounded automatic continuation, GPU
+windows/reservations and scoped reproducible evidence. It is the canonical
+lifecycle protocol.
 The supplied agent permission format supports OpenCode V1, version 1.2.0 or
 newer. OpenCode V2 requires migrated agent definitions; the runner rejects
 that version before starting an experiment. Older V1 versions incorrectly
@@ -61,7 +65,8 @@ placeholder path; supply the entry point from your OpenCode installation.
 Keep the working directory inside the project and use project-relative
 references. Do not put credentials or personal paths in the queue or command,
 and avoid printing secrets or personal data to captured output. The reviewer
-reads only the generated manifest and captured stdout/stderr; include concise
+reads the generated manifest and captured stdout/stderr by default; an explicitly
+approved copied evidence bundle can add configurations and comparisons. Include concise
 metrics and result summaries in those outputs if they need review.
 
 ## Run and automatically review one experiment
@@ -96,10 +101,10 @@ The queue remains blocked until review has been recorded. Review success
 means the reviewer completed; it does not mean the hypothesis passed.
 An experiment task marked `SUCCEEDED` means the execution/review workflow
 completed. Inspect `experiments[].outcome` for the experiment's actual result.
-The runner reads OpenCode's JSON events and requires a non-empty report plus
+The runner reads OpenCode's JSON events and requires a structured REVIEW_REPORT plus
 a final `stop` event. Errors, agent fallback messages, and incomplete reports
 leave the queue blocked. The generated report is stored as `review.md`.
-The runner enforces the wall-clock limit for the direct child process;
+The runner enforces the wall-clock limit for the owned workload and descendants;
 `resource_limit` is recorded for review but is not an operating-system CPU,
 memory, or accelerator quota. Reviewer runs have a 30-minute timeout.
 The reviewer process starts with the project root as its working directory;
@@ -129,8 +134,9 @@ python scripts/experiment_runner.py events --after <next_cursor> --limit 20
 wait for work to finish. `events` returns compact start, warning, completion,
 and attention records, plus `next_cursor`. Keep that cursor to avoid repeating
 old events. A task ID from `review`, `recover`, or `reconcile` is generated
-separately from the experiment ID. No command automatically starts another
-experiment from the queue.
+separately from the experiment ID. By default no next experiment starts.
+The opt-in sealed bridge wakes Main, waits for its decision/acknowledgement,
+and launches its next approved choice within frozen and budget gates.
 
 For an independently approved preparation or analysis script:
 
@@ -160,8 +166,8 @@ of registered workers, not an operating-system process or resource quota.
 The Research Agent should report a submitted task's ID, then return to the
 conversation and read status/events at its next interaction or authorized
 check. It should not hold the foreground in a polling loop. Local event
-records do not send chat messages, wake an idle OpenCode session, or provide
-an app notification service. A synchronous native OpenCode subagent call
+records alone do not wake an idle session. Enable the bounded bridge to send
+completion prompts to the same idle Main session. A synchronous native OpenCode subagent call
 still occupies its caller. To run model work in the background, submit an
 explicitly approved headless CLI command with a primary/all agent, its own
 permissions, and an approved provider data scope. The supplied paper/doc
@@ -204,13 +210,15 @@ resource sample is recorded at process start and every 30 seconds by default:
 - Host CPU usage and total/available RAM.
 - Managed child's CPU usage and resident memory; Linux also reports its I/O.
 - Free disk space on the project volume.
-- Optionally, utilization and memory for selected numeric NVIDIA device IDs.
+- Utilization, memory, power, UUID, process ownership and mature window averages
+  for explicitly selected/reserved numeric NVIDIA device IDs.
 
 CPU rates need two samples; a multithreaded process's CPU rate can exceed
 100 percent because it is measured per core. Missing counters remain null
 or unavailable. Values cover the direct process or whole host/device as
-labelled, not a sum of an entire descendant process tree or a per-task GPU
-allocation. No usernames, hostnames, inherited environment, or raw command
+labelled, not a per-process GPU utilization counter. GPU ownership uses
+process-group/descendant membership; device utilization remains whole-device.
+No usernames, hostnames, inherited environment, or raw command
 arguments are included in telemetry or compact events. Task configuration
 and captured output can contain user-supplied private data; keep them local.
 
@@ -221,15 +229,18 @@ python scripts/experiment_runner.py run --id exp-001 --sample-seconds 30 --stall
 ```
 
 `--sample-seconds` accepts 0.1-3600 seconds. `--stall-seconds` is a positive
-quiet-output threshold, default 900 seconds. GPU reads are disabled unless
-`--gpu-ids` is supplied; they use only `nvidia-smi` queries, with a three-second
+quiet-output threshold, default 900 seconds. CUDA devices are hidden unless
+`--gpu-ids` is supplied; declared IDs reserve cards and enable `nvidia-smi`
+queries, with a three-second
 timeout. An absent GPU or unavailable tool does not prevent a task from
 running. The scripts never allocate GPU memory or start a GPU cache pool.
 
 The sentinel records warnings for quiet logs, free disk below 256 MiB,
 available host RAM below two percent, or selected device memory at least
 95 percent full. Warnings are emitted on transitions and do not kill or retry
-a task. Quiet output alone does not establish a stall. A status read marks
+a task. Low GPU warnings require mature complete averages and consecutive
+independent under-load windows; missing averages remain UNKNOWN. Quiet output
+alone does not establish a stall. A status read marks
 heartbeat age over 45 seconds as stale, and a dead worker as `INTERRUPTED` or,
 if its recorded child still appears alive, `ORPHANED`. These observations
 require inspection and do not authorize a duplicate launch.
@@ -293,7 +304,7 @@ python scripts/experiment_runner.py status --id exp-001
 
 Cancellation writes a request; it does not prove the process has stopped.
 The live worker checks it between supervision waits (normally about one
-second, plus any resource query or bounded local-record retry), stops and reaps its owned direct child,
+second, plus any resource query or bounded local-record retry), stops and verifies its owned workload/descendants,
 then records `CANCELLED`. Preflight version queries can take up to 15 seconds.
 Check status for the terminal result. An already ended/orphaned task cannot
 be cancelled through a dead worker, and parent cancellation does not cascade
@@ -342,9 +353,9 @@ python scripts/experiment_runner.py review --id exp-001 --retry
 Each experiment ID is single-use. Create a newly approved queue row with a
 new ID for an authorized experiment retry. Local manifests, logs, and review
 reports are stored under `.research/`, which is ignored by Git. Inspect them
-for private data before sharing them. The runner supervises the direct child
-process. If an experiment command spawns background children, make that
-command manage and stop them itself. If the computer or runner fails in the
+for private data before sharing them. The runner supervises its POSIX process
+group or Windows Job Object, including descendants. POSIX commands must not
+deliberately escape that group. If the computer or runner fails in the
 small window before an exit result is persisted, recovery requires operator
 reconciliation; the runner will not guess or launch the experiment again.
 

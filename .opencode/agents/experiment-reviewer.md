@@ -40,6 +40,12 @@ Check whether:
   report only the file and type; do not repeat the value.
 
 Do not treat a zero exit code as proof of a successful hypothesis. Do not
-invent results, measurements, or missing context. Return a concise report
-with an overall assessment, prioritized findings, evidence locations,
-limitations, and questions requiring author confirmation.
+invent results, measurements, or missing context. Return `REVIEW_REPORT` and
+one JSON object matching the schema in the request. Include this experiment
+ID, correctness and frozen-constraint verdicts with reasons, concrete file
+evidence, missing evidence, and ranked next options. `VALID` requires both
+checks to PASS and no missing evidence. Failed execution cannot establish a
+valid scientific result. Read copied configuration, metrics, comparisons and
+hashes only when the request explicitly approves the evidence bundle. Do not
+follow source references outside this run. Recommend; never decide or launch.
+Main records the final decision and chooses the next experiment.

@@ -26,6 +26,8 @@ logs/
 experiments.csv
 experiment-log.csv
 experiment-queue.csv
+experiment-queue.csv.lock
+bridge.json
 
 # Local durable runner state, logs, and review results
 .research/
