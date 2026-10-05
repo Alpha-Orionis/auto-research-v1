@@ -1,6 +1,6 @@
 ---
 description: Read-only review of research claims, methods, citations, and evidence.
-mode: subagent
+mode: all
 permission:
   "*": deny
   read:

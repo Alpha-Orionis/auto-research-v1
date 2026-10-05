@@ -1,6 +1,6 @@
 ---
 description: Read-only audit of project plans, experiment records, and technical documentation for consistency and evidence.
-mode: subagent
+mode: all
 permission:
   "*": deny
   read:

@@ -22,12 +22,14 @@ try:
 finally:
     sys.path.pop(0)
 
-FAKE_CLI = '''import json, os, sys, time
+FAKE_CLI = '''import json, os, re, sys, time
 from pathlib import Path
 if "--version" in sys.argv:
     print("1.2.99")
     raise SystemExit(0)
-assert sys.argv[sys.argv.index("--agent") + 1] == "experiment-reviewer"
+agent = sys.argv[sys.argv.index("--agent") + 1]
+assert agent in {"experiment-reviewer", "doc-reviewer", "paper-reviewer"}
+assert re.search(r"^mode:\\s*(all|primary)\\s*$", Path(".opencode/agents", agent + ".md").read_text(), re.MULTILINE)
 with Path("review-calls.txt").open("a") as handle:
     handle.write("x")
 time.sleep(float(os.environ.get("BACKGROUND_REVIEW_DELAY", "0")))
@@ -44,7 +46,8 @@ class BackgroundChecks(unittest.TestCase):
         self.addCleanup(self.stop_workers)
         agents = self.root / ".opencode/agents"
         agents.mkdir(parents=True)
-        shutil.copyfile(PROJECT / ".opencode/agents/experiment-reviewer.md", agents / "experiment-reviewer.md")
+        for name in ("experiment-reviewer", "doc-reviewer", "paper-reviewer"):
+            shutil.copyfile(PROJECT / ".opencode/agents" / (name + ".md"), agents / (name + ".md"))
         fake = self.root / "fake_opencode.py"
         fake.write_text(FAKE_CLI, encoding="utf-8")
         self.prefix = [sys.executable, str(fake)]
@@ -142,6 +145,17 @@ class BackgroundChecks(unittest.TestCase):
         self.assertIn("experiment", {sample["phase"] for sample in samples})
         self.assertIn("review", {sample["phase"] for sample in samples})
         self.assertTrue(all(sample["gpu_status"] == "not_requested" for sample in samples))
+
+    def test_paper_and_document_reviewers_can_run_as_background_subtasks(self):
+        for agent in ("doc-reviewer", "paper-reviewer"):
+            command = [*self.prefix, "run", "--agent", agent, "--format", "json", "Review synthetic approved local evidence only."]
+            self.call("task", "--id", agent, "--command-json", json.dumps(command),
+                      "--time-limit-minutes", "1", "--resource-limit", "one synthetic review process",
+                      "--approval-reference", "synthetic provider and local evidence approval")
+        for agent in ("doc-reviewer", "paper-reviewer"):
+            finished = self.wait_record(agent, lambda item: item["status"] == "SUCCEEDED")
+            report = runtime.runner.parse_review_events(self.root / finished["stdout_reference"])
+            self.assertIn("Synthetic review completed", report)
 
     def test_quiet_output_warns_without_killing_a_healthy_task(self):
         self.task("quiet-task", "import time; time.sleep(3)", "--stall-seconds", "0.1")

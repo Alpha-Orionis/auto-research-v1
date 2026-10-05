@@ -127,6 +127,9 @@ Events are local records; they do not wake an idle OpenCode session. Native
 synchronous subagent calls remain synchronous. Use an approved headless CLI
 command with a CLI-compatible agent if model work needs its own background
 task; keep that agent's permissions and provider data scope bounded.
+The supplied reviewers use mode all for CLI selection. For generic model
+tasks, validate a non-empty report and a final stop event without errors;
+process exit alone does not prove review completion.
 
 During managed processes the sentinel updates a heartbeat about every five
 seconds and samples resources every 30 seconds by default. Quiet-output,

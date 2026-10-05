@@ -78,8 +78,11 @@ hardware setup, environment, repository layout, or research method.
 
 Use the experiment runner for an approved experiment that requires automatic
 review. It launches the Experiment Reviewer after recording process completion.
-Use the paper reviewer or documentation reviewer when a separate read-only
-audit would help. Give each reviewer the minimum project context
+Submit the paper reviewer or documentation reviewer through a bounded
+background `task` when a separate read-only audit would help. Use a headless
+`opencode run --agent <reviewer> --format json` argument array with the
+authorized scope in its prompt and approval for that provider data flow.
+Give each reviewer the minimum project context
 needed. Verify important reviewer claims against the source evidence yourself.
 
 ## Keep the foreground available
@@ -104,6 +107,9 @@ needed. Verify important reviewer claims against the source evidence yourself.
   call is not made asynchronous by these instructions. A background model
   task needs an explicitly approved non-interactive CLI command, a compatible
   primary/all agent, and its own scoped permissions and data-flow approval.
+  The supplied reviewers use mode all to support this CLI route. A generic
+  task's zero exit code is only process completion: check its JSON events for
+  errors, a non-empty report, and final stop before reporting review success.
 - The sentinel records heartbeat and resource samples. Quiet logs or high
   usage are signals to inspect, not proof of a stalled process. Do not kill
   or restart a task based only on a warning. Use `cancel --id` when the user
