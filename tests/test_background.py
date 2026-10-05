@@ -107,7 +107,10 @@ class BackgroundChecks(unittest.TestCase):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 active = [json.loads(path.read_text()) for path in directory.glob("*/status.json")]
-                if all(record.get("status") in runtime.TERMINAL for record in active):
+                # Terminal work status is persisted before the final event and
+                # interpreter shutdown. Wait for the worker to close its files.
+                if all(record.get("status") in runtime.TERMINAL and
+                       not runtime.runner.pid_is_alive(record.get("worker_pid")) for record in active):
                     return
                 time.sleep(0.05)
             self.fail("A synthetic background worker did not stop during cleanup.")
@@ -257,6 +260,20 @@ class BackgroundChecks(unittest.TestCase):
 
 
 class ResourceChecks(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux zombie process state")
+    def test_exited_zombie_is_not_a_live_background_worker(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(runtime.runner.stop_child, child)
+        deadline = time.monotonic() + 5
+        stat = Path(f"/proc/{child.pid}/stat")
+        while time.monotonic() < deadline:
+            if stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                self.assertFalse(runtime.runner.pid_is_alive(child.pid))
+                return
+            time.sleep(0.02)
+        self.fail("Synthetic child did not reach its exited zombie state.")
+
     def test_available_local_cpu_memory_and_disk_counters(self):
         sampler = resource_monitor.Sampler(PROJECT)
         sample = sampler.sample(os.getpid())

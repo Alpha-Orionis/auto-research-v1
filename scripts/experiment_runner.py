@@ -323,6 +323,15 @@ def pid_is_alive(pid: int | None) -> bool:
             raise RunnerError("Cannot determine the recorded process state.")
         finally:
             kernel.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            # A zombie has exited and closed its files but still owns a PID
+            # until its parent/init reaps it. It is not a running workload.
+            process_state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            if process_state in {"Z", "X"}:
+                return False
+        except (OSError, ValueError, IndexError):
+            pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

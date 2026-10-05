@@ -306,7 +306,7 @@ reconciliation; the runner will not guess or launch the experiment again.
 
 Use Python 3.10 or newer and the supported OpenCode V1 CLI on either platform.
 The runner uses `fcntl.flock` on Linux and a file-byte lock on Windows; process
-checks use POSIX signals on Linux and a non-destructive process-handle query
+checks use Linux process state and POSIX signals, or a non-destructive process-handle query
 on Windows. Queue and state updates use atomic file replacement.
 
 On Linux, run from the project root:
