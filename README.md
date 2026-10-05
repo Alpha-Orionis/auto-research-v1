@@ -101,6 +101,7 @@ python3 scripts/experiment_runner.py task --id prepare-001 \
   --time-limit-minutes 10 --resource-limit 'one CPU process' \
   --approval-reference 'approved preparation step' --parent-id exp-001
 python3 scripts/experiment_runner.py status
+python3 scripts/experiment_runner.py alerts --id exp-001
 python3 scripts/experiment_runner.py events
 python3 scripts/experiment_runner.py cancel --id prepare-001
 ```
@@ -118,6 +119,14 @@ process. Long silence in logs and low resources produce warnings, not
 automatic termination. Optional `--gpu-ids 0,1` adds read-only NVIDIA device
 telemetry; no GPU cache pool is created. Telemetry stays in local task files,
 outside the automatic review scope.
+
+Anomalies are recorded separately in `anomalies.jsonl`, with their type,
+severity, observation, threshold, timestamp, and suggested next check.
+`alerts` reports current resource warnings and task/heartbeat problems;
+`events` reports newly raised and resolved conditions. Unavailable counters
+or GPU sampling produce an availability warning, and unknown measurements
+cannot establish recovery. Monitoring observation or recording failures are
+reported through available local channels and do not trigger a task kill.
 
 `status` and `events` read local records without waiting for completion.
 Events support `--after <next_cursor>` for incremental checks. The Research
@@ -173,7 +182,7 @@ defaults; inspect each public commit for your project's data.
 | `.opencode/skills/research-optimization/` | Bounded research workflow |
 | `scripts/experiment_runner.py` | Execution, automatic review, and recovery |
 | `scripts/task_runtime.py` | Detached tasks, heartbeat, status, events, and cancellation |
-| `scripts/resource_monitor.py` | Read-only CPU, memory, disk, and optional NVIDIA telemetry |
+| `scripts/resource_monitor.py` | Read-only CPU, memory, disk, optional NVIDIA telemetry, and anomaly assessment |
 | `templates/` | Blank plans, queues, logs, reviews, and decisions |
 | `docs/usage.md` | Detailed setup, permissions, and recovery |
 | `install.sh` | Prerequisite checks and project-local installation |

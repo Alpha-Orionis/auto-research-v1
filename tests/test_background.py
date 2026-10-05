@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import argparse
+import io
 import json
 import os
 import shutil
@@ -13,6 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "scripts"))
@@ -260,6 +264,146 @@ class BackgroundChecks(unittest.TestCase):
 
 
 class ResourceChecks(unittest.TestCase):
+    def guard(self):
+        temp = tempfile.TemporaryDirectory(prefix="generic-monitor-check-")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        directory = root / ".research/tasks/synthetic"
+        directory.mkdir(parents=True)
+        record = dict(id="synthetic", kind="command", status="RUNNING", worker_pid=os.getpid(),
+                      heartbeat_at=runtime.runner.utc_now(),
+                      status_reference=".research/tasks/synthetic/status.json",
+                      telemetry_reference=".research/tasks/synthetic/resources.jsonl",
+                      anomaly_reference=".research/tasks/synthetic/anomalies.jsonl")
+        guard = runtime.Guard(root, "synthetic", record, dict(sample_seconds=0.1, stall_seconds=900, gpu_ids=[]))
+        for name in ("stdout.log", "stderr.log"):
+            (directory / name).write_text("")
+        return guard, mock.Mock(pid=os.getpid()), directory / "stdout.log", directory / "stderr.log"
+
+    def healthy_sample(self):
+        return dict(timestamp="synthetic", disk_free_bytes=1024 ** 3, memory_total_bytes=1000,
+                    memory_available_bytes=500, counter_status="available", unavailable_counters=[],
+                    gpu_status="not_requested", gpu_device_ids=[], gpus=[])
+
+    def test_resource_anomalies_include_observations_thresholds_and_hints(self):
+        sample = self.healthy_sample()
+        sample.update(disk_free_bytes=1, memory_available_bytes=1, gpu_status="available",
+                      gpu_device_ids=[0], gpus=[dict(index=0, memory_used_mib=95, memory_total_mib=100)])
+        alerts, checked = resource_monitor.detect_anomalies(sample, 901, 900)
+        self.assertEqual(set(alerts), {"quiet_output", "low_disk_space", "low_host_memory", "high_device_memory"})
+        self.assertTrue(set(alerts) <= checked)
+        for value in alerts.values():
+            self.assertTrue(value["observed"])
+            self.assertTrue(value["threshold"])
+            self.assertTrue(value["hint"])
+
+    def test_gpu_partial_or_non_finite_sampling_is_reported(self):
+        completed = subprocess.CompletedProcess([], 0, "1, nan, 10, 100\n", "")
+        with mock.patch.object(resource_monitor.shutil, "which", return_value="nvidia-smi"), mock.patch.object(resource_monitor.subprocess, "run", return_value=completed):
+            values, state = resource_monitor.gpu_counters([1, 2])
+        self.assertEqual(state, "partially_unavailable")
+        self.assertIsNone(values[0]["utilization_percent"])
+        json.dumps(values, allow_nan=False)
+
+    def test_missing_counters_remain_unknown_and_raise_availability_warning(self):
+        with mock.patch.object(resource_monitor, "windows_counters", return_value={}), \
+             mock.patch.object(resource_monitor, "linux_counters", return_value={}), \
+             mock.patch.object(resource_monitor.shutil, "disk_usage", side_effect=OSError("synthetic counter access failure")):
+            sample = resource_monitor.Sampler(PROJECT).sample(os.getpid())
+        alerts, checked = resource_monitor.detect_anomalies(sample, None, 900)
+        self.assertIsNone(sample["disk_free_bytes"])
+        self.assertEqual(sample["counter_status"], "partially_unavailable")
+        self.assertIn("counter_unavailable", alerts)
+        self.assertNotIn("low_disk_space", checked)
+        self.assertNotIn("quiet_output", checked)
+
+    def test_anomaly_journal_records_raised_and_recovered_conditions_once(self):
+        guard, child, stdout, stderr = self.guard()
+        healthy = self.healthy_sample()
+        low = dict(healthy, disk_free_bytes=1)
+        with mock.patch.object(guard.sampler, "sample", side_effect=[low, healthy, healthy]), \
+             mock.patch.object(runtime.time, "monotonic", return_value=100) as clock:
+            guard.tick(child, stdout, stderr)
+            clock.return_value = 101
+            guard.tick(child, stdout, stderr)
+            clock.return_value = 102
+            guard.tick(child, stdout, stderr)
+        rows = [json.loads(line) for line in (guard.directory / "anomalies.jsonl").read_text().splitlines()]
+        self.assertEqual([(row["code"], row["change"]) for row in rows], [("low_disk_space", "raised"), ("low_disk_space", "resolved")])
+        self.assertEqual(rows[1]["observed"]["disk_free_bytes"], healthy["disk_free_bytes"])
+        self.assertEqual(guard.record["active_alerts"], [])
+        events = runtime.events(guard.root)
+        self.assertEqual([event["kind"] for event in events], ["warning", "resolved"])
+        self.assertEqual(events[0]["alert"]["observed"]["disk_free_bytes"], 1)
+
+    def test_unknown_sample_does_not_claim_resource_recovery(self):
+        guard, child, stdout, stderr = self.guard()
+        low = dict(self.healthy_sample(), disk_free_bytes=1)
+        unknown = dict(self.healthy_sample(), disk_free_bytes=None, counter_status="partially_unavailable",
+                       unavailable_counters=["disk_free_bytes"])
+        with mock.patch.object(guard.sampler, "sample", side_effect=[low, unknown]), \
+             mock.patch.object(runtime.time, "monotonic", return_value=100) as clock:
+            guard.tick(child, stdout, stderr)
+            clock.return_value = 101
+            guard.tick(child, stdout, stderr)
+        self.assertTrue(guard.alerts["low_disk_space"]["evidence_stale"])
+        self.assertIn("counter_unavailable", guard.alerts)
+        self.assertFalse(any(event["kind"] == "resolved" for event in runtime.events(guard.root)))
+
+    def test_retrying_event_output_does_not_duplicate_committed_anomaly_records(self):
+        guard, child, stdout, stderr = self.guard()
+        low = dict(self.healthy_sample(), disk_free_bytes=1)
+        with mock.patch.object(guard.sampler, "sample", return_value=low), \
+             mock.patch.object(runtime.time, "monotonic", return_value=100) as clock:
+            with mock.patch.object(runtime, "emit", side_effect=OSError("synthetic event write failure")):
+                guard.tick(child, stdout, stderr)
+            self.assertEqual(len(guard.pending_alert_records), 1)
+            clock.return_value = 101
+            guard.tick(child, stdout, stderr)
+            clock.return_value = 102
+            guard.tick(child, stdout, stderr)
+        journal = [json.loads(line) for line in (guard.directory / "anomalies.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(row["code"] == "low_disk_space" for row in journal), 1)
+        self.assertEqual(sum(event.get("alert", {}).get("code") == "low_disk_space" for event in runtime.events(guard.root)), 1)
+        self.assertEqual(guard.pending_alert_records, [])
+
+    def test_sampling_failure_records_warning_and_does_not_stop_observed_work(self):
+        guard, child, stdout, stderr = self.guard()
+        with mock.patch.object(guard.sampler, "sample", side_effect=RuntimeError("synthetic sampling failure")), \
+             mock.patch.object(runtime.runner, "stop_child") as stop:
+            guard.tick(child, stdout, stderr)
+        stop.assert_not_called()
+        self.assertEqual(guard.record["status"], "RUNNING")
+        self.assertIn("counter_unavailable", guard.alerts)
+        self.assertTrue((guard.directory / "anomalies.jsonl").is_file())
+
+    def test_telemetry_write_failure_is_reported_without_stopping_work(self):
+        guard, child, stdout, stderr = self.guard()
+        real_open = Path.open
+        def denied_telemetry(path, *args, **kwargs):
+            if path.name == "resources.jsonl":
+                raise PermissionError("synthetic telemetry write denial")
+            return real_open(path, *args, **kwargs)
+        with mock.patch.object(guard.sampler, "sample", return_value=self.healthy_sample()), \
+             mock.patch.object(Path, "open", new=denied_telemetry), \
+             mock.patch.object(runtime.runner, "stop_child") as stop:
+            guard.tick(child, stdout, stderr)
+        stop.assert_not_called()
+        self.assertIn("monitor_record_unavailable", guard.alerts)
+        self.assertEqual(guard.record["monitoring_errors"], {"resources": "PermissionError"})
+
+    def test_alert_query_is_read_only_and_reports_stale_heartbeat(self):
+        guard, _, _, _ = self.guard()
+        guard.record["heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        guard.save()
+        before = {path.relative_to(guard.root): path.read_bytes() for path in guard.root.rglob("*") if path.is_file()}
+        result = io.StringIO()
+        with redirect_stdout(result):
+            runtime.dispatch(argparse.Namespace(action="alerts", id="synthetic"), guard.root, guard.root / "experiment-queue.csv", ["opencode"])
+        after = {path.relative_to(guard.root): path.read_bytes() for path in guard.root.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertIn("heartbeat_stale", {value["code"] for value in json.loads(result.getvalue())["alerts"]})
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux zombie process state")
     def test_exited_zombie_is_not_a_live_background_worker(self):
         child = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,

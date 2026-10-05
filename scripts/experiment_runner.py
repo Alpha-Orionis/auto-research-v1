@@ -887,6 +887,8 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--foreground", action="store_true", help="Explicit synchronous mode for terminals or offline checks.")
     status_parser = subparsers.add_parser("status", help="Read task and experiment state without waiting or acquiring the execution lock.")
     status_parser.add_argument("--id")
+    alerts_parser = subparsers.add_parser("alerts", help="Read current anomalies and status warnings without waiting or modifying work.")
+    alerts_parser.add_argument("--id")
     events_parser = subparsers.add_parser("events", help="Read compact local completion/warning events.")
     events_parser.add_argument("--after")
     events_parser.add_argument("--limit", type=int, default=20)
@@ -913,7 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         queue_path.relative_to(root)
     except ValueError as exc:
         raise RunnerError("Queue file must be inside the project directory.") from exc
-    if args.action in {"task", "status", "events", "cancel"} or not getattr(args, "foreground", False):
+    if args.action in {"task", "status", "alerts", "events", "cancel"} or not getattr(args, "foreground", False):
         try:
             import task_runtime
         except ModuleNotFoundError as exc:

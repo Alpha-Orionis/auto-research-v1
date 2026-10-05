@@ -122,7 +122,7 @@ and only one experiment/review worker per project.
 After submitting a task, report the ID and return to the user. Keep foreground
 messages responsive: do not synchronously wait, stream logs into the chat, or
 poll indefinitely. At the next interaction or authorized progress check,
-read `status` and incremental `events`, keeping the returned event cursor.
+read `status`, `alerts`, and incremental `events`, keeping the returned event cursor.
 Events are local records; they do not wake an idle OpenCode session. Native
 synchronous subagent calls remain synchronous. Use an approved headless CLI
 command with a CLI-compatible agent if model work needs its own background
@@ -137,6 +137,11 @@ disk, RAM, and optional selected NVIDIA device warnings require inspection;
 they do not trigger an automatic kill or retry. GPU telemetry is read-only,
 disabled unless device IDs are specified, and never creates a cache pool.
 Telemetry lives in `.research/tasks/` outside the automatic reviewer scope.
+Anomaly journals record observed values, thresholds, and raised/resolved
+transitions. Unknown counters preserve stale warnings instead of claiming
+recovery. Read `alerts` for current conditions and surface new actionable
+events once. Sampling or recording failures are reported through available
+local channels; they do not authorize a kill, repair, or restart.
 Use explicit cancellation and recovery when required. `--foreground` is an
 opt-in terminal mode, not the default for interactive agent work.
 

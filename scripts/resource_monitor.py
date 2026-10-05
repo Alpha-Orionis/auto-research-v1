@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import os
 import shutil
 import subprocess
@@ -119,12 +120,18 @@ def gpu_counters(gpu_ids):
                 continue
             def number(value):
                 try:
-                    return float(value.strip())
+                    result = float(value.strip())
+                    return result if math.isfinite(result) and result >= 0 else None
                 except ValueError:
                     return None
             records.append(dict(index=index, utilization_percent=number(row[1]), memory_used_mib=number(row[2]), memory_total_mib=number(row[3])))
-        return records, "available" if records else "unavailable"
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        complete = {record["index"] for record in records} == set(gpu_ids) and all(
+            record[field] is not None for record in records
+            for field in ("utilization_percent", "memory_used_mib", "memory_total_mib")
+        )
+        complete = complete and all(record["memory_total_mib"] > 0 and record["utilization_percent"] <= 100 for record in records)
+        return records, ("available" if complete else "partially_unavailable") if records else "unavailable"
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
         return [], "unavailable"
 
 
@@ -143,6 +150,7 @@ class Sampler:
             memory_total_bytes=None, memory_available_bytes=None,
             process_read_bytes=None, process_write_bytes=None, disk_free_bytes=None,
         )
+        host = None
         try:
             counters = windows_counters(pid) if os.name == "nt" else linux_counters(pid)
             host = counters.pop("host_ticks", None)
@@ -159,11 +167,74 @@ class Sampler:
                     result["process_cpu_percent"] = round(max(0, 100 * (cpu - old_cpu) / (now - old_time)), 2)
             self.previous_process = (pid, now, cpu) if cpu is not None else None
             result.update(counters)
-        except (OSError, ValueError, AttributeError):
-            result["counter_status"] = "partially_unavailable"
+        except (OSError, ValueError, AttributeError, IndexError):
+            pass
         try:
             result["disk_free_bytes"] = shutil.disk_usage(self.root).free
         except OSError:
             pass
         result["gpus"], result["gpu_status"] = gpu_counters(self.gpu_ids)
+        result["gpu_device_ids"] = list(self.gpu_ids)
+        missing = [name for name in ("memory_total_bytes", "memory_available_bytes", "process_cpu_seconds",
+                                    "process_rss_bytes", "disk_free_bytes") if result.get(name) is None]
+        if host is None:
+            missing.append("host_cpu_counters")
+        result["unavailable_counters"] = missing
+        result["counter_status"] = "partially_unavailable" if missing else "available"
         return result
+
+
+def detect_anomalies(sample, quiet_seconds, quiet_limit):
+    """Pure read-only assessment. Unknown metrics do not establish recovery."""
+    alerts = {}
+    checked = {"counter_unavailable", "gpu_sampling_unavailable"}
+
+    def add(code, message, observed, threshold, hint):
+        alerts[code] = dict(code=code, severity="warning", message=message,
+                            observed=observed, threshold=threshold, hint=hint)
+
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+    if number(quiet_seconds):
+        checked.add("quiet_output")
+    if number(quiet_seconds) and quiet_seconds >= quiet_limit:
+        add("quiet_output", "Captured logs have been quiet longer than the configured threshold.",
+            {"quiet_seconds": round(quiet_seconds, 1)}, {"quiet_seconds": quiet_limit},
+            "Inspect progress and resource evidence; quiet logs alone do not prove a stall.")
+    free = sample.get("disk_free_bytes")
+    if number(free):
+        checked.add("low_disk_space")
+        if free < 256 * 1024 * 1024:
+            add("low_disk_space", "Free disk space is below 256 MiB.", {"disk_free_bytes": free},
+                {"minimum_free_bytes": 256 * 1024 * 1024}, "Inspect the project volume and decide whether to free space or cancel.")
+    total, available = sample.get("memory_total_bytes"), sample.get("memory_available_bytes")
+    if number(total) and total > 0 and number(available):
+        checked.add("low_host_memory")
+        if available / total < 0.02:
+            add("low_host_memory", "Available host RAM is below two percent.",
+                {"memory_total_bytes": total, "memory_available_bytes": available},
+                {"minimum_available_fraction": 0.02}, "Inspect concurrent workloads and the approved memory budget.")
+    gpus = sample.get("gpus", [])
+    complete_gpu_memory = sample.get("gpu_status") == "not_requested"
+    if sample.get("gpu_status") == "available" and gpus:
+        complete_gpu_memory = all(number(gpu.get("memory_used_mib")) and number(gpu.get("memory_total_mib"))
+                                  and gpu["memory_total_mib"] > 0 for gpu in gpus)
+    if complete_gpu_memory:
+        checked.add("high_device_memory")
+    high = [dict(index=gpu.get("index"), memory_used_mib=gpu["memory_used_mib"], memory_total_mib=gpu["memory_total_mib"])
+            for gpu in gpus if number(gpu.get("memory_used_mib")) and number(gpu.get("memory_total_mib"))
+            and gpu["memory_total_mib"] > 0 and gpu["memory_used_mib"] / gpu["memory_total_mib"] >= 0.95]
+    if high:
+        add("high_device_memory", "Selected NVIDIA device memory is at least 95 percent full.",
+            {"devices": high}, {"maximum_used_fraction": 0.95},
+            "Check device workloads; these counters cover the whole device, not this task alone.")
+    if sample.get("counter_status") in {"unavailable", "partially_unavailable"}:
+        add("counter_unavailable", "Some requested CPU, memory, or disk counters are unavailable.",
+            {"unavailable_counters": sample.get("unavailable_counters", [])}, {"expected": "available counters"},
+            "Check operating-system counter access; unavailable data is not proof of healthy resources.")
+    if sample.get("gpu_status") in {"unavailable", "partially_unavailable"}:
+        add("gpu_sampling_unavailable", "Optional NVIDIA sampling is unavailable or incomplete.",
+            {"gpu_status": sample["gpu_status"], "device_ids": sample.get("gpu_device_ids", [])},
+            {"expected": "all selected devices sampled"}, "Check nvidia-smi and the selected device IDs; the task can continue.")
+    return alerts, checked

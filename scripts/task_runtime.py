@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import experiment_runner as runner
-from resource_monitor import Sampler
+from resource_monitor import Sampler, detect_anomalies
 
 
 TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}
@@ -45,6 +45,8 @@ def snapshot(root, job_id):
     record = read_json(local_path(root, f".research/tasks/{job_id}/status.json"))
     if record.get("id") != job_id:
         raise runner.RunnerError("Task identity does not match its directory.")
+    if record.get("status") not in TERMINAL | {"QUEUED", "RUNNING", "ORPHANED"}:
+        raise runner.RunnerError("Malformed task status; inspect or restore its local metadata.")
     record = dict(record)
     if record.get("status") not in TERMINAL:
         pid = record.get("worker_pid")
@@ -106,17 +108,20 @@ def event_order(event_id):
     return int(stamp), suffix
 
 
-def emit(root, job_id, kind, message):
+def emit(root, job_id, kind, message, alert=None):
     with event_writer_lock(root):
         directory = local_path(root, ".research/events")
         latest = max((event_order(path.stem)[0] for path in directory.glob("*.json")
                       if EVENT_ID.fullmatch(path.stem)), default=0)
         # Keep cursor order monotonic even if the machine's wall clock changes.
         event_id = f"{max(time.time_ns(), latest + 1)}-{uuid.uuid4().hex[:8]}"
-        runner.atomic_json(local_path(root, f".research/events/{event_id}.json"), {
+        record = {
             "event_id": event_id, "timestamp": runner.utc_now(), "task_id": job_id,
             "kind": kind, "message": message,
-        })
+        }
+        if alert is not None:
+            record["alert"] = alert
+        runner.atomic_json(local_path(root, f".research/events/{event_id}.json"), record)
 
 
 def events(root, after=None, limit=20):
@@ -128,6 +133,43 @@ def events(root, after=None, limit=20):
     names = sorted((path.stem for path in directory.glob("*.json") if EVENT_ID.fullmatch(path.stem)), key=event_order)
     names = [name for name in names if after is None or event_order(name) > event_order(after)][:limit]
     return [read_json(local_path(root, f".research/events/{name}.json")) for name in names]
+
+
+def task_alerts(record):
+    """Read-only current warning view, including a worker that cannot report."""
+    result = []
+    if record["status"] not in TERMINAL:
+        stored = record.get("active_alerts")
+        if stored is None:
+            stored = [dict(code=code, severity="warning", hint="Inspect the legacy task's latest resource sample.")
+                      for code in record.get("warnings", [])]
+        for alert in stored:
+            value = dict(alert, task_id=record["id"], source="worker")
+            if record.get("worker_alive") is False or record.get("heartbeat_stale"):
+                value["evidence_stale"] = True
+            result.append(value)
+    for code, applies, severity, observed, hint in (
+        ("heartbeat_stale", record.get("heartbeat_stale"), "warning",
+         {"heartbeat_age_seconds": record.get("heartbeat_age_seconds")}, "Inspect the worker; do not infer failure from heartbeat age alone."),
+        ("worker_interrupted", record["status"] == "INTERRUPTED", "error",
+         {"worker_pid": record.get("worker_pid")}, "Inspect recorded outputs and use explicit recovery; never relaunch uncertain work."),
+        ("worker_orphaned", record["status"] == "ORPHANED", "error",
+         {"child_pid": record.get("child_pid")}, "Verify the recorded child and its ownership before taking action."),
+        ("task_failed", record["status"] == "FAILED", "error",
+         {"return_code": record.get("return_code"), "error_type": record.get("error_type")}, "Inspect the task's local error log; retries require a new approved task ID."),
+        ("task_timed_out", record["status"] == "TIMED_OUT", "warning",
+         {"return_code": record.get("return_code")}, "Inspect partial results and the approved deadline before deciding what follows."),
+        ("experiment_outcome", record.get("experiment_outcome") in {"FAILED", "TIMED_OUT"}, "warning",
+         {"outcome": record.get("experiment_outcome")}, "Inspect the experiment result and review; workflow completion does not prove experiment success."),
+        ("monitor_record_incomplete", bool(record.get("monitoring_errors") or record.get("pending_monitor_records")), "warning",
+         {"unavailable_channels": record.get("monitoring_errors", {}), "pending_records": record.get("pending_monitor_records", 0)},
+         "Some monitoring records may be incomplete; inspect available local evidence and file permissions."),
+    ):
+        if applies:
+            result.append(dict(task_id=record["id"], code=code, message=code.replace("_", " ").capitalize() + ".",
+                               severity=severity, observed=observed,
+                               hint=hint, source="status", status_reference=record.get("status_reference")))
+    return result
 
 
 def monitor_options(args):
@@ -164,6 +206,8 @@ def launch(root, job_id, config, limit):
             "stdout_reference": f".research/tasks/{job_id}/worker.stdout.log",
             "stderr_reference": f".research/tasks/{job_id}/worker.stderr.log",
             "telemetry_reference": f".research/tasks/{job_id}/resources.jsonl",
+            "anomaly_reference": f".research/tasks/{job_id}/anomalies.jsonl",
+            "active_alerts": [],
         }
         runner.atomic_json(directory / "config.json", config)
         runner.atomic_json(directory / "status.json", record)
@@ -188,7 +232,12 @@ def launch(root, job_id, config, limit):
 
 
 def dispatch(args, root, queue_path, prefix):
-    if args.action == "status":
+    if args.action == "alerts":
+        records = [snapshot(root, args.id)] if args.id else list_jobs(root)
+        result = {"alerts": [alert for record in records for alert in task_alerts(record)],
+                  "anomaly_references": [{"task_id": record["id"], "reference": record.get("anomaly_reference")}
+                                         for record in records]}
+    elif args.action == "status":
         result = {"tasks": [snapshot(root, args.id)] if args.id else list_jobs(root)}
         ledger = local_path(root, ".research/runner/state.json")
         if ledger.is_file():
@@ -265,6 +314,9 @@ class Guard:
         self.last_size = None
         self.last_progress = time.monotonic()
         self.warnings = set()
+        self.alerts = {}
+        self.record_errors = {}
+        self.pending_alert_records = []
 
     def save(self):
         runner.atomic_json(self.directory / "status.json", self.record)
@@ -272,6 +324,71 @@ class Guard:
     def check_cancel(self):
         if (self.directory / "cancel.json").exists():
             raise runner.ProcessCancelled("Task cancellation was explicitly requested.")
+
+    def recording_error(self, component, error):
+        kind = type(error).__name__
+        if self.record_errors.get(component) != kind:
+            try:
+                print(f"monitor: {component} channel unavailable ({kind}); the managed task continues.", file=sys.stderr)
+            except OSError:
+                pass
+        self.record_errors[component] = kind
+
+    def lifecycle_event(self, kind, message):
+        try:
+            emit(self.root, self.job_id, kind, message)
+        except (OSError, runner.RunnerError) as error:
+            self.recording_error("events", error)
+            if self.record["status"] in TERMINAL | {"ORPHANED"}:
+                self.record["monitoring_errors"] = dict(self.record_errors)
+                try:
+                    self.save()
+                except OSError as storage_error:
+                    self.recording_error("status", storage_error)
+
+    def append_monitor_record(self, filename, value, component):
+        try:
+            target = local_path(self.root, f".research/tasks/{self.job_id}/{filename}")
+            if target != self.directory / filename:
+                raise runner.RunnerError("Monitoring records must stay at their own task artifact paths.")
+            with target.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(value) + "\n")
+                handle.flush()
+            self.record_errors.pop(component, None)
+            return True
+        except (OSError, RuntimeError, runner.RunnerError) as error:
+            self.recording_error(component, error)
+            return False
+
+    def publish_alert(self, change, alert):
+        value = dict(alert, change=change, timestamp=runner.utc_now(), task_id=self.job_id,
+                     phase=self.record.get("phase"), sample_timestamp=self.record.get("latest_resources", {}).get("timestamp"),
+                     telemetry_reference=self.record.get("telemetry_reference"))
+        if len(self.pending_alert_records) >= 256:
+            self.recording_error("alert_buffer", BufferError())
+            return
+        self.pending_alert_records.append(dict(value=value, journal_written=False, event_written=False))
+
+    def flush_alert_records(self):
+        # Keep reporting retries bounded so a broken output channel cannot
+        # monopolize process supervision or cancellation checks.
+        for pending in self.pending_alert_records[:4]:
+            value = pending["value"]
+            if not pending["journal_written"]:
+                pending["journal_written"] = self.append_monitor_record("anomalies.jsonl", value, "anomalies")
+            if not pending["event_written"]:
+                try:
+                    emit(self.root, self.job_id, "warning" if value["change"] == "raised" else "resolved", value["message"], alert=value)
+                    pending["event_written"] = True
+                    self.record_errors.pop("events", None)
+                except (OSError, runner.RunnerError) as error:
+                    self.recording_error("events", error)
+            if not (pending["journal_written"] and pending["event_written"]):
+                break
+        self.pending_alert_records = [pending for pending in self.pending_alert_records
+                                      if not (pending["journal_written"] and pending["event_written"])]
+        if len(self.pending_alert_records) < 256:
+            self.record_errors.pop("alert_buffer", None)
 
     def tick(self, child, stdout, stderr):
         self.check_cancel()
@@ -282,40 +399,77 @@ class Guard:
             self.last_progress = now
             self.record["child_pid"] = child.pid
             self.record["phase"] = "review" if stdout.name.endswith("events.jsonl") else ("experiment" if self.record["kind"] == "experiment" else "task")
-        size = sum(path.stat().st_size if path.exists() else 0 for path in (stdout, stderr))
-        if self.last_size is None or size != self.last_size:
+        try:
+            size = sum(path.stat().st_size for path in (stdout, stderr))
+            self.record_errors.pop("progress", None)
+        except OSError as error:
+            size = None
+            self.recording_error("progress", error)
+        if size is not None and (self.last_size is None or size != self.last_size):
             self.last_progress, self.last_size = now, size
-        warnings = set()
-        quiet = now - self.last_progress
-        self.record["output_quiet_seconds"] = round(quiet, 1)
-        if quiet >= self.options["stall_seconds"]:
-            warnings.add("quiet_output")
+        quiet = now - self.last_progress if size is not None else None
+        self.record["output_quiet_seconds"] = round(quiet, 1) if quiet is not None else None
         if new_phase or now - self.last_sample >= self.options["sample_seconds"]:
-            sample = self.sampler.sample(child.pid)
+            try:
+                sample = self.sampler.sample(child.pid)
+            except Exception as error:
+                # Observation failures must not terminate the observed work.
+                sample = dict(timestamp=runner.utc_now(), pid=child.pid, counter_status="unavailable",
+                              unavailable_counters=["sampling_error"], sampling_error_type=type(error).__name__, gpus=[],
+                              gpu_status="unavailable" if self.options["gpu_ids"] else "not_requested",
+                              gpu_device_ids=self.options["gpu_ids"])
             sample["phase"] = self.record["phase"]
-            with (self.directory / "resources.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(sample) + "\n")
-                handle.flush()
+            self.append_monitor_record("resources.jsonl", sample, "resources")
             self.record["latest_resources"] = sample
             self.last_sample = now
         resources = self.record.get("latest_resources", {})
-        if resources.get("disk_free_bytes") is not None and resources["disk_free_bytes"] < 256 * 1024 * 1024:
-            warnings.add("low_disk_space")
-        total, available = resources.get("memory_total_bytes"), resources.get("memory_available_bytes")
-        if total and available is not None and available / total < 0.02:
-            warnings.add("low_host_memory")
-        for gpu in resources.get("gpus", []):
-            used, capacity = gpu.get("memory_used_mib"), gpu.get("memory_total_mib")
-            if capacity and used is not None and used / capacity >= 0.95:
-                warnings.add("high_device_memory")
+        alerts, checked = detect_anomalies(resources, quiet, self.options["stall_seconds"])
+        checked.add("monitor_record_unavailable")
+        if self.record_errors:
+            alerts["monitor_record_unavailable"] = dict(
+                code="monitor_record_unavailable", severity="warning", message="Some local monitoring channels are unavailable.",
+                observed={"unavailable_channels": dict(self.record_errors)}, threshold={"expected": "local monitoring channels available"},
+                hint="Check disk space and file permissions; available channels still report the anomaly and work continues.")
+        for code, alert in self.alerts.items():
+            if code not in checked and code not in alerts:
+                alerts[code] = dict(alert, evidence_stale=True)
+        warnings = set(alerts)
         warning_changed = warnings != self.warnings
         for warning in sorted(warnings - self.warnings):
-            emit(self.root, self.job_id, "warning", warning + "; inspect evidence. This is not an automatic termination trigger.")
+            self.publish_alert("raised", alerts[warning])
+        for warning in sorted(self.warnings - warnings):
+            fields = {
+                "low_disk_space": ("disk_free_bytes",),
+                "low_host_memory": ("memory_total_bytes", "memory_available_bytes"),
+                "high_device_memory": ("gpus", "gpu_status"),
+                "counter_unavailable": ("counter_status", "unavailable_counters"),
+                "gpu_sampling_unavailable": ("gpu_status", "gpu_device_ids"),
+            }.get(warning, ())
+            observation = {name: resources.get(name) for name in fields}
+            observation["sample_timestamp"] = resources.get("timestamp")
+            if warning == "quiet_output":
+                observation["quiet_seconds"] = round(quiet, 1) if quiet is not None else None
+            if warning == "monitor_record_unavailable":
+                observation["unavailable_channels"] = dict(self.record_errors)
+            resolved = dict(self.alerts[warning], message=f"Condition cleared: {warning}.",
+                            observed=observation,
+                            hint="Inspect the current sample before making the next decision.")
+            self.publish_alert("resolved", resolved)
+        if self.pending_alert_records and (new_phase or warning_changed or now - self.last_heartbeat >= 5):
+            self.flush_alert_records()
+        self.alerts = alerts
         self.warnings = warnings
         self.record["warnings"] = sorted(warnings)
+        self.record["active_alerts"] = [alerts[code] for code in sorted(alerts)]
+        self.record["monitoring_errors"] = dict(self.record_errors)
+        self.record["pending_monitor_records"] = len(self.pending_alert_records)
         if new_phase or warning_changed or now - self.last_heartbeat >= 5:
             self.record["heartbeat_at"] = runner.utc_now()
-            self.save()
+            try:
+                self.save()
+                self.record_errors.pop("status", None)
+            except OSError as error:
+                self.recording_error("status", error)
             self.last_heartbeat = now
 
 
@@ -329,7 +483,7 @@ def worker(root, job_id):
         record.update(status="RUNNING", worker_pid=os.getpid(), heartbeat_at=runner.utc_now(), phase="preflight")
         guard = Guard(root, job_id, record, config["monitor"])
         guard.save()
-        emit(root, job_id, "started", "Background worker started; use status for progress.")
+        guard.lifecycle_event("started", "Background worker started; use status for progress.")
         runner.SUPERVISION_OBSERVER = guard.tick
         try:
             # Do not start a workload before the parent has durably registered
@@ -373,8 +527,11 @@ def worker(root, job_id):
             else:
                 record["child_pid"] = None
             record.update(finished_at=runner.utc_now(), heartbeat_at=runner.utc_now(), phase="finished")
+            guard.flush_alert_records()
+            record["monitoring_errors"] = dict(guard.record_errors)
+            record["pending_monitor_records"] = len(guard.pending_alert_records)
             guard.save()
-            emit(root, job_id, "completed" if record["status"] == "SUCCEEDED" else "attention", "Background task ended: " + record["status"] + ". Inspect status and its local evidence.")
+            guard.lifecycle_event("completed" if record["status"] == "SUCCEEDED" else "attention", "Background task ended: " + record["status"] + ". Inspect status and its local evidence.")
         return 0 if record["status"] == "SUCCEEDED" else 2
 
 

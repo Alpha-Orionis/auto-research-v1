@@ -120,6 +120,7 @@ Use the receipt's task ID to inspect it:
 ```text
 python scripts/experiment_runner.py status --id exp-001
 python scripts/experiment_runner.py status
+python scripts/experiment_runner.py alerts --id exp-001
 python scripts/experiment_runner.py events --limit 20
 python scripts/experiment_runner.py events --after <next_cursor> --limit 20
 ```
@@ -233,8 +234,53 @@ heartbeat age over 45 seconds as stale, and a dead worker as `INTERRUPTED` or,
 if its recorded child still appears alive, `ORPHANED`. These observations
 require inspection and do not authorize a duplicate launch.
 
+Each newly observed anomaly is also recorded under
+`.research/tasks/<task-id>/anomalies.jsonl`. A record contains:
+
+- A stable code, warning severity, observation time, and execution phase.
+- The observed values, comparison threshold, and suggested next check.
+- The corresponding sample timestamp and a project-relative telemetry reference.
+- `change: raised` or `change: resolved` when fresh evidence clears the condition.
+
+Repeated samples of the same active condition update the status snapshot
+rather than creating repeated notifications. Unknown or missing measurements
+retain an earlier resource warning with `evidence_stale: true`; they never
+establish recovery. GPU reads missing a selected device or returning unknown
+values produce `gpu_sampling_unavailable`. Missing host/process counters
+produce `counter_unavailable`. Optional GPU sampling that was not requested
+does not create an alert.
+
+Inspect the current warning view without waiting for or changing a task:
+
+```text
+python scripts/experiment_runner.py alerts
+python scripts/experiment_runner.py alerts --id exp-001
+python scripts/experiment_runner.py events --after <next_cursor>
+```
+
+`alerts` reads stored active anomalies and derives heartbeat, interrupted,
+orphaned, failed, and timed-out task warnings from the saved state. These
+query-derived warnings do not rewrite status or start another process.
+Warnings from a finished task's last resource sample remain historical in
+its journal; current resource alerts cover live monitoring. Structured
+`warning` and `resolved` events include the anomaly evidence. Foreground
+agents should surface new actionable events once, with the task ID and a
+brief next check. Events are local; they do not push messages into an idle
+chat or notify an external service.
+
+Sampling failures and monitoring channel failures are advisory. The worker
+continues its approved work and tries available local channels, including
+the status record and worker error log. Pending anomaly records are retried
+with bounded batches and a buffer capped at 256; output already committed
+to one channel is not repeated there when another channel is retried.
+If storage is unavailable, records can be incomplete; status reports the
+unavailable channels and pending record count when it can still be saved.
+This does not bypass critical experiment state persistence, approved
+deadlines, or explicit cancellation. No anomaly changes resource settings,
+allocates GPU memory, restarts a task, or executes repair commands.
+
 Resource samples stay in `.research/tasks/<task-id>/resources.jsonl`; compact
-events stay in `.research/events/`. They are outside the Experiment Reviewer's
+events stay in `.research/events/`. Samples, anomaly journals, and events are outside the Experiment Reviewer's
 `.research/runs/` read scope and are not automatically sent to the model.
 There is no independent monitoring daemon or automatic restart after reboot.
 
@@ -247,7 +293,7 @@ python scripts/experiment_runner.py status --id exp-001
 
 Cancellation writes a request; it does not prove the process has stopped.
 The live worker checks it between supervision waits (normally about one
-second, plus any resource query), stops and reaps its owned direct child,
+second, plus any resource query or bounded local-record retry), stops and reaps its owned direct child,
 then records `CANCELLED`. Preflight version queries can take up to 15 seconds.
 Check status for the terminal result. An already ended/orphaned task cannot
 be cancelled through a dead worker, and parent cancellation does not cascade
@@ -368,7 +414,8 @@ python -m unittest discover -s tests -v
 These checks use synthetic experiments and a fake OpenCode process. They
 exercise completion, failure, timeout, locking, queue gating, and recovery
 as well as detached launches, foreground status responsiveness, concurrent
-subtasks, cancellation, warnings, and unavailable GPU counters, without
+subtasks, cancellation, anomaly transitions, unavailable counters, partial GPU
+reads, observation/recording failures, and read-only alert queries, without
 sending project data to a model provider.
 On Linux, use `python3` if needed. GitHub Actions runs these checks on Linux
 and Windows with Python 3.10 and 3.12. Platform-specific checks are skipped
