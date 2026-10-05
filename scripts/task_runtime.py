@@ -14,11 +14,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import experiment_runner as runner
-from resource_monitor import Sampler, detect_anomalies
+from resource_monitor import Sampler, GPUWindow, detect_anomalies
+from gpu_reservation import reserve
+from process_control import process_members
 
 
 TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}
 EVENT_ID = re.compile(r"^[0-9]+-[a-f0-9]{8}$")
+DETACHED_WORKERS = {}
+
+
+def reap_workers():
+    # Long-lived bridge callers retain and non-blockingly reap their own
+    # detached Popen handles. CLI-only callers can exit immediately.
+    for pid, process in list(DETACHED_WORKERS.items()):
+        if process.poll() is not None:
+            DETACHED_WORKERS.pop(pid)
 
 
 def local_path(root, relative):
@@ -48,6 +59,12 @@ def snapshot(root, job_id):
     if record.get("status") not in TERMINAL | {"QUEUED", "RUNNING", "ORPHANED"}:
         raise runner.RunnerError("Malformed task status; inspect or restore its local metadata.")
     record = dict(record)
+    if record.get("status") in TERMINAL and record.get("worker_cleanup_verified") is False:
+        if record.get("worker_pid") and not runner.pid_is_alive(record["worker_pid"]) and not record.get("child_pid"):
+            # Supervision cleared the workload before recording terminal.
+            # A crash before the reservation-close receipt must not leave
+            # an eternal logical reservation.
+            record["worker_cleanup_verified"] = True
     if record.get("status") not in TERMINAL:
         pid = record.get("worker_pid")
         launch = directory / "launch.json"
@@ -56,7 +73,9 @@ def snapshot(root, job_id):
         if pid is not None:
             record["worker_alive"] = runner.pid_is_alive(pid)
             if not record["worker_alive"]:
-                record["status"] = "ORPHANED" if runner.pid_is_alive(record.get("child_pid")) else "INTERRUPTED"
+                child_pid = record.get("child_pid")
+                descendants = process_members(child_pid) if child_pid and os.name != "nt" else []
+                record["status"] = "ORPHANED" if runner.pid_is_alive(child_pid) or descendants else "INTERRUPTED"
         else:
             # A missing launch receipt is uncertain, not permission to relaunch.
             record["worker_alive"] = None
@@ -72,6 +91,7 @@ def snapshot(root, job_id):
 
 
 def list_jobs(root):
+    reap_workers()
     directory = local_path(root, ".research/tasks")
     if not directory.exists():
         return []
@@ -80,6 +100,10 @@ def list_jobs(root):
         if path.is_dir() and (path / "status.json").is_file():
             jobs.append(snapshot(root, path.name))
     return jobs
+
+
+def job_active(record):
+    return record["status"] not in TERMINAL or record.get("worker_cleanup_verified") is False
 
 
 @contextmanager
@@ -180,7 +204,15 @@ def monitor_options(args):
     if args.gpu_ids and not re.fullmatch(r"[0-9]+(,[0-9]+)*", args.gpu_ids):
         raise runner.RunnerError("--gpu-ids must be comma-separated numeric NVIDIA device IDs.")
     gpu_ids = [int(value) for value in args.gpu_ids.split(",")] if args.gpu_ids else []
-    return dict(sample_seconds=args.sample_seconds, stall_seconds=args.stall_seconds, gpu_ids=sorted(set(gpu_ids)))
+    window = getattr(args, "gpu_window_seconds", 300)
+    threshold = getattr(args, "gpu_low_threshold", 30)
+    consecutive = getattr(args, "gpu_bad_windows", 3)
+    if not 30 <= window <= 3600 or not 0 <= threshold <= 100 or not 1 <= consecutive <= 10:
+        raise runner.RunnerError("GPU window must be 30-3600s, threshold 0-100, consecutive windows 1-10.")
+    if gpu_ids and args.sample_seconds > window/2:
+        raise runner.RunnerError("GPU sampling interval must be at most half its averaging window.")
+    return dict(sample_seconds=args.sample_seconds, stall_seconds=args.stall_seconds, gpu_ids=sorted(set(gpu_ids)),
+                gpu_window_seconds=window, gpu_low_threshold=threshold, gpu_bad_windows=consecutive)
 
 
 def launch(root, job_id, config, limit):
@@ -188,11 +220,20 @@ def launch(root, job_id, config, limit):
     with runner.process_lock(local_path(root, ".research/tasks/launch.lock")):
         if directory.exists():
             raise runner.RunnerError("Task IDs are single-use; choose a new ID.")
-        active = [job for job in list_jobs(root) if job.get("status") not in TERMINAL]
+        active = [job for job in list_jobs(root) if job_active(job)]
         if len(active) >= limit:
             raise runner.RunnerError("Background concurrency limit reached; inspect existing tasks.")
         if config["kind"] == "experiment" and any(job.get("kind") == "experiment" for job in active):
             raise runner.RunnerError("An experiment/review worker is already active in this project.")
+        selected_gpus = set(config["monitor"]["gpu_ids"])
+        if any(selected_gpus & set(job.get("gpu_ids", [])) for job in active):
+            raise runner.RunnerError("A selected GPU is reserved by an existing managed task.")
+        ledger_path = local_path(root, ".research/runner/state.json")
+        if ledger_path.exists():
+            ledger = runner.read_state(ledger_path)
+            for experiment in ledger["experiments"].values():
+                if selected_gpus & set(experiment.get("gpu_ids", [])) and experiment.get("status") in {"RUNNING", "INTERRUPTED"}:
+                    raise runner.RunnerError("Resolve the foreground experiment's GPU ownership before a new GPU task.")
         parent = config.get("parent_id")
         if parent:
             snapshot(root, parent)
@@ -208,6 +249,8 @@ def launch(root, job_id, config, limit):
             "telemetry_reference": f".research/tasks/{job_id}/resources.jsonl",
             "anomaly_reference": f".research/tasks/{job_id}/anomalies.jsonl",
             "active_alerts": [],
+            "gpu_ids": sorted(selected_gpus),
+            "worker_cleanup_verified": False,
         }
         runner.atomic_json(directory / "config.json", config)
         runner.atomic_json(directory / "status.json", record)
@@ -216,16 +259,19 @@ def launch(root, job_id, config, limit):
         worker = None
         try:
             with (directory / "worker.stdout.log").open("wb") as stdout, (directory / "worker.stderr.log").open("wb") as stderr:
+                environment = dict(os.environ)
+                environment.setdefault("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true")
                 worker = subprocess.Popen(
                     command, cwd=root, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                    shell=False, close_fds=True, start_new_session=os.name != "nt", creationflags=flags,
+                    shell=False, close_fds=True, start_new_session=os.name != "nt", creationflags=flags, env=environment,
                 )
             # Parent and worker write different files to avoid a startup race.
             runner.atomic_json(directory / "launch.json", {"pid": worker.pid, "created_at": runner.utc_now()})
+            DETACHED_WORKERS[worker.pid] = worker
         except OSError as error:
             if worker is not None:
                 runner.stop_child(worker)
-            record.update(status="FAILED", phase="launch_failed", finished_at=runner.utc_now())
+            record.update(status="FAILED", phase="launch_failed", finished_at=runner.utc_now(), worker_cleanup_verified=True)
             runner.atomic_json(directory / "status.json", record)
             raise runner.RunnerError("Background worker could not be started; inspect its local files.") from error
     return {"task_id": job_id, "submitted": True, "worker_pid": worker.pid, "status_reference": record["status_reference"]}
@@ -290,7 +336,8 @@ def dispatch(args, root, queue_path, prefix):
             else:
                 job_id = args.action + "-" + uuid.uuid4().hex[:12]
             argv = ["--project", str(root), "--queue", queue_path.relative_to(root).as_posix(),
-                    "--opencode-command-json", json.dumps(prefix), args.action, "--foreground"]
+                    "--opencode-command-json", json.dumps(prefix), args.action, "--foreground",
+                    "--gpu-ids", args.gpu_ids]
             if args.action in {"run", "review", "reconcile"}:
                 argv += ["--id", args.id]
             if args.action == "review" and args.retry:
@@ -309,6 +356,9 @@ class Guard:
         self.directory = job_path(root, job_id)
         self.options = options
         self.sampler = Sampler(root, options["gpu_ids"])
+        self.gpu_window = GPUWindow(options["gpu_ids"], options.get("gpu_window_seconds", 300),
+                                    options.get("gpu_low_threshold", 30), options.get("gpu_bad_windows", 3),
+                                    max_gap=options["sample_seconds"]*2.5)
         self.last_heartbeat = self.last_sample = 0.0
         self.last_pid = None
         self.last_size = None
@@ -399,6 +449,8 @@ class Guard:
             self.last_progress = now
             self.record["child_pid"] = child.pid
             self.record["phase"] = "review" if stdout.name.endswith("events.jsonl") else ("experiment" if self.record["kind"] == "experiment" else "task")
+            self.gpu_window.samples.clear()
+            self.gpu_window.bad, self.gpu_window.last_check = 0, None
         try:
             size = sum(path.stat().st_size for path in (stdout, stderr))
             self.record_errors.pop("progress", None)
@@ -419,6 +471,7 @@ class Guard:
                               gpu_status="unavailable" if self.options["gpu_ids"] else "not_requested",
                               gpu_device_ids=self.options["gpu_ids"])
             sample["phase"] = self.record["phase"]
+            sample["gpu_window"] = self.gpu_window.update(sample, now)
             self.append_monitor_record("resources.jsonl", sample, "resources")
             self.record["latest_resources"] = sample
             self.last_sample = now
@@ -475,6 +528,26 @@ class Guard:
 
 def worker(root, job_id):
     directory = job_path(root, job_id)
+    config = read_json(directory / "config.json")
+    try:
+        # Kernel locks also cover foreground invocations and close on crashes.
+        with reserve(root, config["monitor"]["gpu_ids"], runner.process_lock, runner.contained_path):
+            code = worker_reserved(root, job_id)
+        record = read_json(directory / "status.json")
+        if record["status"] in TERMINAL:
+            record["worker_cleanup_verified"] = True
+            runner.atomic_json(directory / "status.json", record)
+        return code
+    except runner.RunnerError:
+        record = read_json(directory / "status.json")
+        if record.get("status") == "QUEUED":
+            record.update(status="FAILED", error_type="GPUReservationConflict", finished_at=runner.utc_now(), worker_cleanup_verified=True)
+            runner.atomic_json(directory / "status.json", record)
+        raise
+
+
+def worker_reserved(root, job_id):
+    directory = job_path(root, job_id)
     with runner.process_lock(directory / "worker.lock"):
         record = read_json(directory / "status.json")
         config = read_json(directory / "config.json")
@@ -504,6 +577,7 @@ def worker(root, job_id):
                               stderr_reference=f".research/tasks/{job_id}/stderr.log")
                 return_code, timed_out = runner.supervise(
                     command, cwd, directory / "stdout.log", directory / "stderr.log", config["timeout_seconds"], lambda pid: None,
+                    env=dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, config["monitor"]["gpu_ids"]))),
                 )
                 record.update(return_code=return_code, status="TIMED_OUT" if timed_out else ("SUCCEEDED" if return_code == 0 else "FAILED"))
             elif config["kind"] == "experiment":
@@ -522,7 +596,9 @@ def worker(root, job_id):
             record.update(status="FAILED", return_code=2, error_type=type(error).__name__)
         finally:
             runner.SUPERVISION_OBSERVER = None
-            if record.get("child_pid") and runner.pid_is_alive(record["child_pid"]):
+            child_pid = record.get("child_pid")
+            descendants = process_members(child_pid) if child_pid and os.name != "nt" else []
+            if child_pid and (runner.pid_is_alive(child_pid) or descendants):
                 record["status"] = "ORPHANED"
             else:
                 record["child_pid"] = None

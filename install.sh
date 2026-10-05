@@ -119,12 +119,18 @@ def main():
         "scripts/experiment_runner.py",
         "scripts/task_runtime.py",
         "scripts/resource_monitor.py",
+        "scripts/process_control.py",
+        "scripts/gpu_reservation.py",
+        "scripts/evidence_bundle.py",
+        "scripts/main_bridge.py",
         "templates/project-contract.template.md",
         "templates/experiment-plan.template.md",
         "templates/experiment-queue.template.csv",
         "templates/experiment-log.template.csv",
         "templates/review-report.template.md",
         "templates/decision-record.template.md",
+        "templates/bridge.template.json",
+        "docs/reliability.md",
     ]
     additions = []
     for name in files:
@@ -147,7 +153,7 @@ def main():
     old_ignore = ignore.read_bytes() if ignore.exists() else None
     ignore_data = old_ignore if old_ignore is not None else (source / ".gitignore").read_bytes()
     text = ignore_data.decode("utf-8-sig")
-    required = [".research/", "experiment-queue.csv", "experiment-log.csv", "__pycache__/", "*.py[cod]", ".env", ".env.*"]
+    required = [".research/", "experiment-queue.csv", "experiment-queue.csv.lock", "experiment-log.csv", "bridge.json", "__pycache__/", "*.py[cod]", ".env", ".env.*"]
     existing_patterns = {line.strip() for line in text.splitlines()}
     missing = [line for line in required if line not in existing_patterns]
     if missing:

@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "server_url": "http://127.0.0.1:4096",
+  "session_id": "",
+  "approval_reference": "",
+  "contract": "project-contract.md",
+  "queue": "experiment-queue.csv",
+  "allowed_ids": [],
+  "frozen_paths": [],
+  "max_experiments": 3,
+  "max_elapsed_minutes": 120,
+  "max_total_experiment_minutes": 90,
+  "poll_seconds": 15,
+  "opencode_command": ["opencode"]
+}

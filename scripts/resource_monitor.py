@@ -10,6 +10,8 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import deque
+from process_control import process_members
 
 
 def windows_counters(pid):
@@ -104,7 +106,7 @@ def gpu_counters(gpu_ids):
         return [], "unavailable"
     try:
         completed = subprocess.run(
-            [executable, "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+            [executable, "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,uuid",
              "--format=csv,noheader,nounits", "--id=" + ",".join(str(value) for value in gpu_ids)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3, shell=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -113,7 +115,7 @@ def gpu_counters(gpu_ids):
             return [], "unavailable"
         records = []
         for row in csv.reader(io.StringIO(completed.stdout)):
-            if len(row) != 4:
+            if len(row) not in {4, 6}:
                 continue
             index = int(row[0].strip())
             if index not in gpu_ids:
@@ -124,7 +126,9 @@ def gpu_counters(gpu_ids):
                     return result if math.isfinite(result) and result >= 0 else None
                 except ValueError:
                     return None
-            records.append(dict(index=index, utilization_percent=number(row[1]), memory_used_mib=number(row[2]), memory_total_mib=number(row[3])))
+            records.append(dict(index=index, utilization_percent=number(row[1]), memory_used_mib=number(row[2]),
+                                memory_total_mib=number(row[3]), power_watts=number(row[4]) if len(row) == 6 else None,
+                                uuid=row[5].strip() if len(row) == 6 else None))
         complete = {record["index"] for record in records} == set(gpu_ids) and all(
             record[field] is not None for record in records
             for field in ("utilization_percent", "memory_used_mib", "memory_total_mib")
@@ -133,6 +137,98 @@ def gpu_counters(gpu_ids):
         return records, ("available" if complete else "partially_unavailable") if records else "unavailable"
     except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
         return [], "unavailable"
+
+
+def gpu_ownership(gpus, pid):
+    members = process_members(pid)
+    executable = shutil.which("nvidia-smi")
+    if members is None or not executable or any(not gpu.get("uuid") for gpu in gpus):
+        return [], "unknown", []
+    try:
+        completed = subprocess.run([executable, "--query-compute-apps=gpu_uuid,pid,used_memory",
+                                    "--format=csv,noheader,nounits"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=3, shell=False,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        if completed.returncode:
+            return [], "unknown", members
+        indices = {gpu["uuid"]: gpu["index"] for gpu in gpus}
+        processes = []
+        for row in csv.reader(io.StringIO(completed.stdout)):
+            if not row:
+                continue
+            if len(row) != 3:
+                return [], "unknown", members
+            if row[0].strip() not in indices:
+                continue
+            owner_pid = int(row[1].strip())
+            try:
+                memory = float(row[2].strip())
+                if not math.isfinite(memory) or memory < 0:
+                    memory = None
+            except ValueError:
+                memory = None
+            processes.append(dict(index=indices[row[0].strip()], pid=owner_pid,
+                                  memory_used_mib=memory, owned=owner_pid in members))
+        return processes, "available", members
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return [], "unknown", members
+
+
+class GPUWindow:
+    """Time-weighted, complete windows; consecutive counts advance once per window."""
+    def __init__(self, ids, seconds=300, threshold=30, consecutive=3, max_gap=75):
+        self.ids = tuple(ids)
+        self.seconds, self.threshold, self.required, self.max_gap = seconds, threshold, consecutive, max_gap
+        self.samples = deque()
+        self.last_check = None
+        self.bad = 0
+
+    def update(self, sample, now=None):
+        now = time.monotonic() if now is None else now
+        devices = {gpu["index"]: gpu.get("utilization_percent") for gpu in sample.get("gpus", [])}
+        complete = sample.get("gpu_status") == "available" and set(devices) == set(self.ids) and bool(self.ids)
+        complete = complete and all(isinstance(value, (int, float)) and math.isfinite(value) and 0 <= value <= 100 for value in devices.values())
+        if not complete or (self.samples and now-self.samples[-1][0] > self.max_gap):
+            self.samples.clear()
+            self.bad, self.last_check = 0, None
+        if complete:
+            self.samples.append((now, devices, sample.get("gpu_ownership_status"), sample.get("project_gpu_ids", [])))
+        start = now-self.seconds
+        while len(self.samples) > 2 and self.samples[1][0] <= start:
+            self.samples.popleft()
+        mature = len(self.samples) >= 3 and self.samples[0][0] <= start
+        means = {str(index): None for index in self.ids}
+        raw_means = {}
+        owned = sorted(set(sample.get("project_gpu_ids", [])))
+        ownership_known = sample.get("gpu_ownership_status") == "available"
+        under_load = mature and all(item[2] == "available" and set(self.ids).issubset(item[3]) for item in self.samples)
+        if mature:
+            for index in self.ids:
+                integral = 0.0
+                for left, right in zip(self.samples, list(self.samples)[1:]):
+                    a, b = max(start, left[0]), right[0]
+                    if b > a:
+                        # Piecewise constant sampled device utilization.
+                        integral += (b-a)*left[1][index]
+                raw_means[str(index)] = integral/self.seconds
+                means[str(index)] = round(raw_means[str(index)], 2)
+            if self.last_check is None or now-self.last_check >= self.seconds:
+                low = under_load and any(value < self.threshold for value in means.values())
+                self.bad = self.bad+1 if low else 0
+                self.last_check = now
+        if not under_load:
+            self.bad = 0
+        average = round(sum(raw_means.values())/len(raw_means), 2) if mature else None
+        return dict(window_seconds=self.seconds, window_mature=mature, sample_count=len(self.samples),
+                    average_gpu_utilization_percent=average, per_gpu_average_percent=means,
+                    project_gpu_ids=owned, ownership_status="available" if ownership_known else "unknown",
+                    workload_present=under_load, low_utilization_threshold_percent=self.threshold,
+                    consecutive_bad_windows=self.bad, required_bad_windows=self.required,
+                    alert_ready=under_load and self.bad >= self.required,
+                    current_gpu_status=sample.get("gpu_status", "unknown"),
+                    missing_fields=([] if mature else ["mature_window_average"])
+                    + (["gpu_ownership"] if self.ids and not ownership_known else [])
+                    + (["complete_gpu_samples"] if self.ids and not complete else []))
 
 
 class Sampler:
@@ -175,6 +271,9 @@ class Sampler:
             pass
         result["gpus"], result["gpu_status"] = gpu_counters(self.gpu_ids)
         result["gpu_device_ids"] = list(self.gpu_ids)
+        processes, ownership, members = gpu_ownership(result["gpus"], pid) if self.gpu_ids else ([], "not_requested", [])
+        result.update(gpu_processes=processes, gpu_ownership_status=ownership, managed_process_ids=members,
+                      project_gpu_ids=sorted({item["index"] for item in processes if item["owned"]}))
         missing = [name for name in ("memory_total_bytes", "memory_available_bytes", "process_cpu_seconds",
                                     "process_rss_bytes", "disk_free_bytes") if result.get(name) is None]
         if host is None:
@@ -237,4 +336,12 @@ def detect_anomalies(sample, quiet_seconds, quiet_limit):
         add("gpu_sampling_unavailable", "Optional NVIDIA sampling is unavailable or incomplete.",
             {"gpu_status": sample["gpu_status"], "device_ids": sample.get("gpu_device_ids", [])},
             {"expected": "all selected devices sampled"}, "Check nvidia-smi and the selected device IDs; the task can continue.")
+    window = sample.get("gpu_window", {})
+    if window.get("window_mature") and window.get("ownership_status") == "available":
+        checked.add("low_gpu_utilization")
+    if window.get("alert_ready") is True:
+        add("low_gpu_utilization", "Owned GPUs have sustained low window-average utilization under load.",
+            window, {"minimum_average_percent": window["low_utilization_threshold_percent"],
+                     "consecutive_windows": window["required_bad_windows"]},
+            "Inspect the workload, data pipeline and per-GPU averages before choosing a controlled optimization.")
     return alerts, checked

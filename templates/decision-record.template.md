@@ -24,3 +24,7 @@ Explain how the evidence supports the decision.
 ## Next step
 
 State the next action or why work should stop.
+
+For managed runs, also persist the decision with runner `decide --id ...
+--assessment ... --rationale ... [--next-id ...]`. In a sealed loop acknowledge
+the completion event with `ack`; prose alone does not drive continuation.
