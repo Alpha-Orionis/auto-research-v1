@@ -26,3 +26,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run offline checks
         run: python -m unittest discover -s tests -v
+      - name: Check installer shell syntax
+        if: runner.os == 'Linux'
+        run: bash -n install.sh

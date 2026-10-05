@@ -24,6 +24,13 @@ default agent.
 
 ## Use them in another project
 
+On Linux, WSL, or Git Bash, run `bash install.sh --target /path/to/project`
+from this repository after installing the supported Python and OpenCode
+versions. `bash install.sh --check` performs preflight checks without
+installing files. The installer preserves an existing queue and rejects
+conflicting agent, runner, or template files before copying. See
+[README](../README.md) for installer options.
+
 Copy the `.opencode/` and `scripts/` directories into the other project's
 root to use the agents and runner. Copy `templates/` only if you want the
 supplied blank forms.
