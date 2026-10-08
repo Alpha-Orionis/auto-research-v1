@@ -16,6 +16,10 @@ completion/wake/next-experiment bridge, GPU window averages and reservations,
 and scoped reproducibility bundles. See the canonical
 [Reliable experiment loop](docs/reliability.md) protocol.
 
+A minimal ZCode backend drives the same loop with the same queue schema and
+artifact layout, using a foreground synchronous runner and a read-only
+reviewer subagent; see [ZCode support](#zcode-support).
+
 ## Requirements
 
 - Python **3.10 or newer**. The runner and installer use the standard library.
@@ -99,6 +103,20 @@ you explicitly want a terminal command to wait for execution and review.
 Artifacts are stored under `.research/runs/<id>/`. A completed review requires
 a structured `REVIEW_REPORT` and a complete OpenCode JSON event receipt. Failed or
 incomplete reviews block subsequent runs.
+
+## ZCode support
+
+Projects running ZCode instead of OpenCode can drive the same loop:
+`zcode/zcode_runner.py` consumes the same `experiment-queue.csv` schema
+and writes the same `.research/runs/<id>/` artifacts, executed
+synchronously in the foreground. After a run, the ZCode main session
+spawns the read-only reviewer subagent (`zcode/agents/experiment-reviewer.md`)
+and records the final decision with `decide`. The backend enforces the
+same discipline: approval before run, one experiment at a time,
+single-use ids, dependency decisions, and append-only records. Detached
+workers, resource telemetry, and the bridge remain OpenCode-runner
+features. See [the ZCode protocol](zcode/PROTOCOL.md) and
+[usage](docs/zcode.md).
 
 ## Background subtasks and monitoring
 
@@ -194,8 +212,10 @@ defaults; inspect each public commit for your project's data.
 | `scripts/experiment_runner.py` | Execution, automatic review, and recovery |
 | `scripts/task_runtime.py` | Detached tasks, heartbeat, status, events, and cancellation |
 | `scripts/resource_monitor.py` | Read-only CPU, memory, disk, optional NVIDIA telemetry, and anomaly assessment |
+| `zcode/` | Minimal synchronous ZCode backend: runner, protocol, and reviewer agent |
 | `templates/` | Blank plans, queues, logs, reviews, and decisions |
 | `docs/usage.md` | Detailed setup, permissions, and recovery |
+| `docs/zcode.md` | ZCode backend setup and usage |
 | `install.sh` | Prerequisite checks and project-local installation |
 | `tests/` | Offline runner, background, monitoring, and installer checks |
 
